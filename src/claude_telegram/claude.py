@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -78,6 +79,40 @@ def find_latest_session(working_dir: str) -> str | None:
     return latest.stem
 
 
+def get_session_permission_mode(working_dir: str) -> str | None:
+    """Check if a session was started with bypass permissions mode."""
+    project_dir = get_project_dir(working_dir)
+    if not project_dir:
+        return None
+
+    sessions = [
+        f for f in project_dir.glob("*.jsonl")
+        if not f.name.startswith("agent-")
+    ]
+
+    if not sessions:
+        return None
+
+    latest = max(sessions, key=lambda f: f.stat().st_mtime)
+
+    # Read first few lines to find permissionMode
+    try:
+        with open(latest, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i > 10:  # Only check first 10 lines
+                    break
+                try:
+                    data = json.loads(line)
+                    if "permissionMode" in data:
+                        return data["permissionMode"]
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+
+    return None
+
+
 class ClaudeRunner:
     """Runs Claude Code for a specific working directory."""
 
@@ -149,6 +184,7 @@ class ClaudeRunner:
         continue_session: bool = False,
         on_output: callable = None,
         allowed_tools: list[str] | None = None,
+        bypass_permissions: bool = False,
     ) -> ClaudeResult:
         """
         Run Claude Code with a message.
@@ -158,11 +194,16 @@ class ClaudeRunner:
             continue_session: If True, resume the session
             on_output: Optional callback for streaming output
             allowed_tools: Optional list of tools to allow (e.g., ["Write", "Bash(echo:*)"])
+            bypass_permissions: If True, skip all permission prompts
 
         Returns:
             ClaudeResult with response text and any permission denials
         """
         cmd = [self.cli_path, "--print", "--output-format", "stream-json", "--verbose"]
+
+        # Add bypass permissions if specified
+        if bypass_permissions:
+            cmd.append("--dangerously-skip-permissions")
 
         # Add allowed tools if specified
         if allowed_tools:
@@ -192,11 +233,16 @@ class ClaudeRunner:
 
         cwd = Path(self.working_dir) if self.working_dir else None
 
+        # Set environment variable to prevent hook from sending duplicate notifications
+        env = os.environ.copy()
+        env["CLAUDE_TELEGRAM_BOT"] = "1"
+
         self.current_process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=cwd,
+            env=env,
         )
 
         # Parse stream-json output

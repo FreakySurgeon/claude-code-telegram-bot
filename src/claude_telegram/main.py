@@ -40,7 +40,7 @@ def get_continue_message() -> str:
     return f"🔄 <i>{verb}...</i>"
 
 from . import telegram
-from .claude import sessions, ClaudeResult, PermissionDenial
+from .claude import sessions, ClaudeResult, PermissionDenial, get_session_permission_mode
 from .config import settings
 from .markdown import markdown_to_telegram_html
 from .tunnel import tunnel, CloudflareTunnel
@@ -529,6 +529,31 @@ async def handle_callback(callback: dict):
             parse_mode="HTML",
         )
 
+    elif data == "perm:bypass":
+        # User wants to continue with bypass permissions
+        logger.info(f"perm:bypass clicked, pending_permissions: {pending_permissions}")
+        pending = pending_permissions.get(str(chat_id))
+        if not pending:
+            await telegram.send_message(
+                "No pending permission request.",
+                chat_id=chat_id,
+                parse_mode="HTML",
+            )
+            return
+
+        # Clear pending and retry with bypass
+        original_message = pending["message"]
+        del pending_permissions[str(chat_id)]
+
+        await telegram.send_message(
+            f"🔓 <i>Retrying with bypass permissions...</i>",
+            chat_id=chat_id,
+            parse_mode="HTML",
+        )
+
+        # Retry with bypass permissions
+        await run_claude(original_message, chat_id, continue_session=True, bypass_permissions=True)
+
 
 async def animate_status(chat_id: str, message_id: int, continue_session: bool, session_name: str):
     """Animate the status message with rotating messages."""
@@ -551,6 +576,7 @@ async def run_claude(
     chat_id: str,
     continue_session: bool = False,
     allowed_tools: list[str] | None = None,
+    bypass_permissions: bool = False,
 ):
     """Run Claude and send response to Telegram."""
     runner = get_runner()
@@ -596,6 +622,7 @@ async def run_claude(
             message,
             continue_session=continue_session,
             allowed_tools=allowed_tools,
+            bypass_permissions=bypass_permissions,
         )
 
         # Stop animation
@@ -683,14 +710,24 @@ async def send_permission_request(
     if result.text.strip():
         msg += f"\n\n<i>{result.text[:500]}</i>"
 
-    buttons = {
-        "inline_keyboard": [
-            [
-                {"text": "✅ Allow & Retry", "callback_data": "perm:allow"},
-                {"text": "❌ Deny", "callback_data": "perm:deny"},
-            ]
-        ]
-    }
+    # Check if original session was in bypass mode
+    permission_mode = get_session_permission_mode(session_dir)
+    was_bypass = permission_mode == "bypassPermissions"
+
+    # Build buttons - add bypass option if session was originally in bypass mode
+    button_row = [
+        {"text": "✅ Allow & Retry", "callback_data": "perm:allow"},
+        {"text": "❌ Deny", "callback_data": "perm:deny"},
+    ]
+
+    buttons = {"inline_keyboard": [button_row]}
+
+    # Add bypass button on second row if session was in bypass mode
+    if was_bypass:
+        buttons["inline_keyboard"].append([
+            {"text": "🔓 Continue with bypass", "callback_data": "perm:bypass"}
+        ])
+        msg += "\n\n<i>Original session was in bypass mode.</i>"
 
     await telegram.send_message(
         msg,
@@ -785,16 +822,39 @@ def split_text(text: str, chunk_size: int) -> list[str]:
 
 
 @app.post("/notify/{event_type}")
-async def notify(event_type: str):
+async def notify(event_type: str, request: Request):
     """Called by Claude hooks to send notifications."""
+    # Try to parse JSON body for summary
+    summary = None
+    working_dir = None
+    try:
+        data = await request.json()
+        summary = data.get("summary")
+        working_dir = data.get("working_dir")
+    except Exception:
+        pass  # No JSON body, that's fine
+
     if event_type == "completed":
-        msg = "✅ Claude has completed the task."
+        msg = "✅ <b>Claude has completed the task.</b>"
+        if working_dir:
+            dir_name = working_dir.split("/")[-1]
+            msg = f"✅ <b>Claude has completed</b> (<code>{dir_name}</code>)"
+        if summary:
+            # Truncate and convert to Telegram HTML
+            summary_text = summary[:1500] if len(summary) > 1500 else summary
+            try:
+                summary_html = markdown_to_telegram_html(summary_text)
+            except Exception:
+                # Fallback to escaped plain text if markdown parsing fails
+                import html
+                summary_html = html.escape(summary_text)
+            msg += f"\n\n{summary_html}"
     elif event_type == "waiting":
         msg = "⏸ Claude is waiting for input."
     else:
         msg = f"📢 Claude event: {event_type}"
 
-    await telegram.send_message(msg)
+    await telegram.send_message(msg, parse_mode="HTML")
     return {"ok": True}
 
 
