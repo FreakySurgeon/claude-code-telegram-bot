@@ -9,7 +9,7 @@ from .config import settings
 
 logger = logging.getLogger(__name__)
 
-TELEGRAM_API = f"https://api.telegram.org/bot{settings.telegram_bot_token}"
+DEFAULT_API_URL = f"https://api.telegram.org/bot{settings.telegram_bot_token}"
 
 
 async def send_message(
@@ -17,8 +17,10 @@ async def send_message(
     chat_id: str | None = None,
     parse_mode: str = "Markdown",
     reply_markup: dict | None = None,
+    api_url: str | None = None,
 ) -> dict:
     """Send a message to Telegram."""
+    api = api_url or DEFAULT_API_URL
     chat_id = chat_id or settings.telegram_chat_id
 
     # Telegram requires non-empty text
@@ -38,7 +40,7 @@ async def send_message(
         payload["reply_markup"] = reply_markup
 
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+        response = await client.post(f"{api}/sendMessage", json=payload)
         if response.status_code != 200:
             logger.error(f"Telegram error: {response.status_code} - {response.text}")
         response.raise_for_status()
@@ -50,8 +52,10 @@ async def edit_message(
     text: str,
     chat_id: str | None = None,
     parse_mode: str = "Markdown",
+    api_url: str | None = None,
 ) -> dict:
     """Edit an existing message."""
+    api = api_url or DEFAULT_API_URL
     chat_id = chat_id or settings.telegram_chat_id
 
     payload = {
@@ -63,27 +67,29 @@ async def edit_message(
         payload["parse_mode"] = parse_mode
 
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{TELEGRAM_API}/editMessageText", json=payload)
+        response = await client.post(f"{api}/editMessageText", json=payload)
         response.raise_for_status()
         return response.json()
 
 
-async def delete_message(chat_id: str | int, message_id: int) -> dict:
+async def delete_message(chat_id: str | int, message_id: int, api_url: str | None = None) -> dict:
     """Delete a message."""
+    api = api_url or DEFAULT_API_URL
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"{TELEGRAM_API}/deleteMessage",
+            f"{api}/deleteMessage",
             json={"chat_id": chat_id, "message_id": message_id},
         )
         response.raise_for_status()
         return response.json()
 
 
-async def set_webhook(url: str) -> dict:
+async def set_webhook(url: str, api_url: str | None = None) -> dict:
     """Set the Telegram webhook URL."""
+    api = api_url or DEFAULT_API_URL
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"{TELEGRAM_API}/setWebhook",
+            f"{api}/setWebhook",
             json={"url": url, "allowed_updates": ["message", "callback_query"]},
         )
         response.raise_for_status()
@@ -97,24 +103,26 @@ async def set_webhook(url: str) -> dict:
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
-async def set_webhook_with_retry(url: str) -> dict:
+async def set_webhook_with_retry(url: str, api_url: str | None = None) -> dict:
     """Set webhook with exponential backoff retry for DNS propagation."""
-    return await set_webhook(url)
+    return await set_webhook(url, api_url=api_url)
 
 
-async def delete_webhook() -> dict:
+async def delete_webhook(api_url: str | None = None) -> dict:
     """Delete the Telegram webhook."""
+    api = api_url or DEFAULT_API_URL
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{TELEGRAM_API}/deleteWebhook")
+        response = await client.post(f"{api}/deleteWebhook")
         response.raise_for_status()
         return response.json()
 
 
-async def get_updates(offset: int = 0, timeout: int = 30) -> list[dict]:
+async def get_updates(offset: int = 0, timeout: int = 30, api_url: str | None = None) -> list[dict]:
     """Get updates using long polling."""
+    api = api_url or DEFAULT_API_URL
     async with httpx.AsyncClient(timeout=timeout + 10) as client:
         response = await client.post(
-            f"{TELEGRAM_API}/getUpdates",
+            f"{api}/getUpdates",
             json={
                 "offset": offset,
                 "timeout": timeout,
@@ -126,16 +134,37 @@ async def get_updates(offset: int = 0, timeout: int = 30) -> list[dict]:
         return data.get("result", [])
 
 
-async def answer_callback(callback_query_id: str, text: str | None = None) -> dict:
+async def answer_callback(callback_query_id: str, text: str | None = None, api_url: str | None = None) -> dict:
     """Answer a callback query (inline button press)."""
+    api = api_url or DEFAULT_API_URL
     payload = {"callback_query_id": callback_query_id}
     if text:
         payload["text"] = text
 
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{TELEGRAM_API}/answerCallbackQuery", json=payload)
+        response = await client.post(f"{api}/answerCallbackQuery", json=payload)
         response.raise_for_status()
         return response.json()
+
+
+async def get_file(file_id: str, api_url: str | None = None) -> dict:
+    """Get file info for downloading."""
+    api = api_url or DEFAULT_API_URL
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{api}/getFile", json={"file_id": file_id})
+        response.raise_for_status()
+        return response.json()
+
+
+async def download_file(file_path: str, api_url: str | None = None) -> bytes:
+    """Download a file from Telegram servers."""
+    api = api_url or DEFAULT_API_URL
+    token = api.split("/bot")[1]
+    url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        return response.content
 
 
 def is_authorized(chat_id: str | int) -> bool:
