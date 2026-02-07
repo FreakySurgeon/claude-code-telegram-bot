@@ -182,6 +182,7 @@ class ClaudeRunner:
         message: str,
         *,
         continue_session: bool = False,
+        new_session: bool = False,
         on_output: callable = None,
         allowed_tools: list[str] | None = None,
         bypass_permissions: bool = False,
@@ -194,6 +195,7 @@ class ClaudeRunner:
         Args:
             message: The prompt to send to Claude
             continue_session: If True, resume the session
+            new_session: If True, force a new session (ignore stored session_id)
             on_output: Optional callback for streaming output
             allowed_tools: Optional list of tools to allow (e.g., ["Write", "Bash(echo:*)"])
             bypass_permissions: If True, skip all permission prompts
@@ -221,22 +223,23 @@ class ClaudeRunner:
         if mcp_config:
             cmd.extend(["--mcp-config", mcp_config])
 
-        # Always try to resume an existing session for this directory
-        if self.session_id:
-            # We already have a session ID from previous run
-            cmd.extend(["--resume", self.session_id])
-        elif self.working_dir:
-            # Try to find existing session for this directory
-            session_id = find_latest_session(self.working_dir)
-            if session_id:
-                cmd.extend(["--resume", session_id])
-                self.session_id = session_id
-                logger.info(f"Resuming stored session {session_id} for {self.short_name}")
+        # Session handling: new_session forces a fresh start, otherwise try to resume
+        if not new_session:
+            if self.session_id:
+                # We already have a session ID from previous run
+                cmd.extend(["--resume", self.session_id])
+            elif self.working_dir:
+                # Try to find existing session for this directory
+                session_id = find_latest_session(self.working_dir)
+                if session_id:
+                    cmd.extend(["--resume", session_id])
+                    self.session_id = session_id
+                    logger.info(f"Resuming stored session {session_id} for {self.short_name}")
+                elif continue_session:
+                    # Fallback to --continue if explicitly requested
+                    cmd.append("--continue")
             elif continue_session:
-                # Fallback to --continue if explicitly requested
                 cmd.append("--continue")
-        elif continue_session:
-            cmd.append("--continue")
 
         # Prompt is a positional argument, not a flag
         cmd.append(message)
@@ -299,21 +302,23 @@ class ClaudeRunner:
         self.current_process = None
         self.last_interaction = datetime.now()
 
-        # Update session ID after run
-        if result_session_id:
-            self.session_id = result_session_id
-        elif self.working_dir:
-            new_session_id = find_latest_session(self.working_dir)
-            if new_session_id:
-                self.session_id = new_session_id
+        # Update session ID after run (but not for one-off new_session runs like email/cron)
+        if not new_session:
+            if result_session_id:
+                self.session_id = result_session_id
+            elif self.working_dir:
+                new_session_id = find_latest_session(self.working_dir)
+                if new_session_id:
+                    self.session_id = new_session_id
 
-        if self.session_id:
-            logger.info(f"Session ID for {self.short_name}: {self.session_id}")
+        run_session_id = result_session_id or self.session_id
+        if run_session_id:
+            logger.info(f"Session ID for {self.short_name}: {run_session_id}")
 
         return ClaudeResult(
             text=result_text,
             permission_denials=permission_denials,
-            session_id=self.session_id,
+            session_id=run_session_id,
         )
 
     async def compact(self) -> ClaudeResult:
