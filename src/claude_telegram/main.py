@@ -1174,20 +1174,19 @@ async def _process_email(data: dict, bot: BotConfig):
         runner = get_runner_for_bot(bot)
         result = await runner.run(
             prompt,
-            continue_session=False,
+            new_session=True,  # Don't resume interactive session
             bypass_permissions=True,
             system_prompt=bot.system_prompt,
             mcp_config=bot.mcp_config_path,
         )
 
-        # Send summary to Telegram
-        summary = result.text[:500] if result.text else "(pas de réponse)"
-        await telegram.send_message(
-            f"📧 <b>Email +claude traité</b>\n\nDe: {from_addr}\nSujet: {subject}\n\n{summary}",
-            chat_id=bot.chat_id,
-            parse_mode="HTML",
-            api_url=bot.api_url,
-        )
+        # Send header + full response to Telegram
+        header = f"📧 <b>Email +claude traité</b>\n\nDe: {from_addr}\nSujet: {subject}\n\n"
+        await telegram.send_message(header, chat_id=bot.chat_id, parse_mode="HTML", api_url=bot.api_url)
+        if result.text:
+            await send_response(result.text, bot.chat_id, session_name="gtd", api_url=bot.api_url)
+        else:
+            await telegram.send_message("(pas de réponse)", chat_id=bot.chat_id, api_url=bot.api_url)
     except Exception as e:
         logger.exception("Email processing error")
         await telegram.send_message(
@@ -1222,7 +1221,7 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
         runner = get_runner_for_bot(bot)
         result = await runner.run(
             prompt,
-            continue_session=True,
+            new_session=True,  # Don't resume interactive session
             bypass_permissions=True,
             system_prompt=bot.system_prompt,
             mcp_config=bot.mcp_config_path,
