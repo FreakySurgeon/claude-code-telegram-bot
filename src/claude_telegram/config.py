@@ -26,7 +26,31 @@ class Settings(BaseSettings):
     # - webhook: Use manual webhook_url
     mode: str = "polling"
 
+    # Favorite repos (comma-separated paths relative to home)
+    favorite_repos: str = ""
+
+    # GTD Bot (second Telegram bot identity)
+    gtd_bot_token: str | None = None
+    gtd_chat_id: str | None = None
+    gtd_working_dir: str | None = None
+    gtd_prompt_path: str | None = None
+    gtd_mcp_config: str | None = None
+
+    # Transcription
+    mistral_api_key: str | None = None
+    whisper_bin: str = "/opt/whisper.cpp/build/bin/whisper-cli"
+    whisper_model: str = "/opt/whisper.cpp/models/ggml-medium.bin"
+
+    # Email webhook
+    webhook_secret: str | None = None
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+
+    def get_favorite_repos(self) -> list[str]:
+        """Parse favorite repos from comma-separated string."""
+        if not self.favorite_repos:
+            return []
+        return [r.strip() for r in self.favorite_repos.split(",") if r.strip()]
 
 
 settings = Settings()
