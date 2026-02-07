@@ -185,6 +185,8 @@ class ClaudeRunner:
         on_output: callable = None,
         allowed_tools: list[str] | None = None,
         bypass_permissions: bool = False,
+        system_prompt: str | None = None,
+        mcp_config: str | None = None,
     ) -> ClaudeResult:
         """
         Run Claude Code with a message.
@@ -195,6 +197,8 @@ class ClaudeRunner:
             on_output: Optional callback for streaming output
             allowed_tools: Optional list of tools to allow (e.g., ["Write", "Bash(echo:*)"])
             bypass_permissions: If True, skip all permission prompts
+            system_prompt: Optional system prompt to append (e.g., GTD bot)
+            mcp_config: Optional path to MCP config file
 
         Returns:
             ClaudeResult with response text and any permission denials
@@ -208,6 +212,14 @@ class ClaudeRunner:
         # Add allowed tools if specified
         if allowed_tools:
             cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+
+        # Add system prompt if specified (GTD bot)
+        if system_prompt:
+            cmd.extend(["--append-system-prompt", system_prompt])
+
+        # Add MCP config if specified
+        if mcp_config:
+            cmd.extend(["--mcp-config", mcp_config])
 
         # Always try to resume an existing session for this directory
         if self.session_id:
