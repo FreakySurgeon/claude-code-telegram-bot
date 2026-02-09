@@ -408,7 +408,26 @@ async def handle_voice(message: dict, bot: BotConfig):
         # For GTD bot: process directly via Claude
         if not bot.multi_session:
             transcription_prompt = f"[Transcription vocale ({result.duration_formatted}, {result.engine})]\n\n{result.text}"
-            await run_claude(transcription_prompt, chat_id, bot, continue_session=False)
+            if gtd_queue is not None:
+                item = QueueItem(
+                    prompt=transcription_prompt,
+                    source="telegram",
+                    chat_id=chat_id,
+                    continue_session=False,
+                )
+                added = await gtd_queue.enqueue(item)
+                if not added:
+                    await telegram.send_message(
+                        "⚠️ Queue pleine (10 max), réessaie plus tard",
+                        chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                    )
+                elif gtd_queue.size > 1:
+                    await telegram.send_message(
+                        f"📥 Message vocal reçu (position {gtd_queue.size} dans la file)",
+                        chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                    )
+            else:
+                await run_claude(transcription_prompt, chat_id, bot, continue_session=False)
         else:
             # For Dev bot: show transcription with button to process
             # Truncate text for callback_data (max 64 bytes)
