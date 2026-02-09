@@ -107,6 +107,7 @@ from .claude import sessions, ClaudeResult, PermissionDenial, get_session_permis
 from .config import settings
 from .markdown import markdown_to_telegram_html
 from .tunnel import tunnel, CloudflareTunnel
+from .queue import QueueItem, RequestQueue, process_queue_item
 
 # Store pending permission requests for retry
 pending_permissions: dict[str, dict] = {}  # chat_id -> {message, denials, session_key, bot_name}
@@ -119,6 +120,10 @@ chat_to_bot: dict[str, str] = {}
 
 # Polling tasks
 polling_tasks: list[asyncio.Task] = []
+
+# Queue for GTD bot (initialized in lifespan)
+gtd_queue: RequestQueue | None = None
+queue_worker_task: asyncio.Task | None = None
 
 def get_runner_for_bot(bot: BotConfig):
     """Get the appropriate runner for a bot."""
@@ -181,7 +186,7 @@ async def poll_updates(bot: BotConfig):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Setup and teardown."""
-    global bots, chat_to_bot, polling_tasks, tunnel_url
+    global bots, chat_to_bot, polling_tasks, tunnel_url, gtd_queue, queue_worker_task
 
     # Initialize bots
     bots = create_bots()
@@ -229,9 +234,22 @@ async def lifespan(app: FastAPI):
             task = asyncio.create_task(poll_updates(bot))
             polling_tasks.append(task)
 
+    # Start GTD queue worker
+    gtd_bot_instance = bots.get("gtd")
+    if gtd_bot_instance:
+        gtd_queue = RequestQueue(maxsize=10)
+        queue_worker_task = asyncio.create_task(queue_worker(gtd_queue, gtd_bot_instance))
+
     yield
 
     # Cleanup
+    if queue_worker_task:
+        queue_worker_task.cancel()
+        try:
+            await queue_worker_task
+        except asyncio.CancelledError:
+            pass
+
     for task in polling_tasks:
         task.cancel()
         try:
@@ -247,6 +265,24 @@ async def lifespan(app: FastAPI):
         await telegram.delete_webhook(api_url=bots["dev"].api_url)
 
 
+
+async def queue_worker(queue: RequestQueue, bot: BotConfig):
+    """Worker loop: dequeue and process items one at a time."""
+    logger.info("Queue worker started")
+    while True:
+        try:
+            item = await queue.dequeue()
+            logger.info(f"Processing queued {item.source} request (retry={item.retry_count})")
+            runner = get_runner_for_bot(bot)
+            await process_queue_item(item, runner, bot, queue=queue)
+        except asyncio.CancelledError:
+            logger.info("Queue worker stopped")
+            break
+        except Exception:
+            logger.exception("Queue worker error")
+            await asyncio.sleep(1)
+
+
 app = FastAPI(title="Claude Telegram", lifespan=lifespan)
 
 
@@ -260,6 +296,7 @@ async def health():
         "current_session": current.short_name,
         "in_conversation": current.is_in_conversation(),
         "active_sessions": len(sessions.sessions),
+        "queue_size": gtd_queue.size if gtd_queue else 0,
     }
 
 
@@ -310,6 +347,29 @@ async def handle_message(message: dict, bot: BotConfig):
     # Auto-continue if current session is in conversation
     runner = get_runner_for_bot(bot)
     continue_session = runner.is_in_conversation() or quick_reply
+
+    # GTD bot: enqueue for sequential processing
+    if not bot.multi_session and gtd_queue is not None:
+        item = QueueItem(
+            prompt=text,
+            source="telegram",
+            chat_id=chat_id,
+            continue_session=continue_session,
+        )
+        added = await gtd_queue.enqueue(item)
+        if not added:
+            await telegram.send_message(
+                "⚠️ Queue pleine (10 max), réessaie plus tard",
+                chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+            )
+        elif gtd_queue.size > 1:
+            await telegram.send_message(
+                f"📥 Message reçu (position {gtd_queue.size} dans la file)",
+                chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+            )
+        return
+
+    # Dev bot: direct execution (existing behavior)
     await run_claude(text, chat_id, bot, continue_session=continue_session)
 
 
@@ -561,13 +621,15 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig):
 
     elif cmd == "/cancel":
         runner = get_runner_for_bot(bot)
-        if await runner.cancel():
-            await telegram.send_message(
-                f"🛑 Cancelled <code>{runner.short_name}</code>",
-                chat_id=chat_id,
-                parse_mode="HTML",
-                api_url=bot.api_url,
-            )
+        cancelled = await runner.cancel()
+        drained = 0
+        if gtd_queue and not bot.multi_session:
+            drained = gtd_queue.drain()
+        if cancelled or drained:
+            msg = f"🛑 Cancelled <code>{runner.short_name}</code>"
+            if drained:
+                msg += f" + {drained} en file supprimé(s)"
+            await telegram.send_message(msg, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url)
         else:
             await telegram.send_message("Nothing to cancel", chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url)
 
@@ -578,12 +640,10 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig):
         else:
             status = "💤 <b>Idle</b>"
         conv = "in conversation" if runner.is_in_conversation() else "new session"
-        await telegram.send_message(
-            f"📂 <code>{runner.short_name}</code>\n{status} • {conv}",
-            chat_id=chat_id,
-            parse_mode="HTML",
-            api_url=bot.api_url,
-        )
+        msg = f"📂 <code>{runner.short_name}</code>\n{status} • {conv}"
+        if gtd_queue and not bot.multi_session:
+            msg += f"\n📥 Queue: {gtd_queue.size} en attente"
+        await telegram.send_message(msg, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url)
 
     elif cmd == "/rmdir":
         if args:
@@ -1170,31 +1230,43 @@ async def _process_email(data: dict, bot: BotConfig):
         f"NE PAS relire l'email via Gmail, le contenu est ci-dessus."
     )
 
-    try:
-        runner = get_runner_for_bot(bot)
-        result = await runner.run(
-            prompt,
-            new_session=True,  # Don't resume interactive session
-            bypass_permissions=True,
-            system_prompt=bot.system_prompt,
-            mcp_config=bot.mcp_config_path,
-        )
-
-        # Send header + full response to Telegram
-        header = f"📧 <b>Email +claude traité</b>\n\nDe: {from_addr}\nSujet: {subject}\n\n"
-        await telegram.send_message(header, chat_id=bot.chat_id, parse_mode="HTML", api_url=bot.api_url)
-        if result.text:
-            await send_response(result.text, bot.chat_id, session_name="gtd", api_url=bot.api_url)
-        else:
-            await telegram.send_message("(pas de réponse)", chat_id=bot.chat_id, api_url=bot.api_url)
-    except Exception as e:
-        logger.exception("Email processing error")
-        await telegram.send_message(
-            f"❌ Erreur traitement email: <code>{e}</code>\nSujet: {subject}",
+    if gtd_queue is not None:
+        item = QueueItem(
+            prompt=prompt,
+            source="email",
             chat_id=bot.chat_id,
-            parse_mode="HTML",
-            api_url=bot.api_url,
+            new_session=True,
+            metadata={"subject": subject, "from": from_addr},
         )
+        added = await gtd_queue.enqueue(item)
+        if not added:
+            await telegram.send_message(
+                f"⚠️ Queue pleine, email ignoré: {subject}",
+                chat_id=bot.chat_id, parse_mode="HTML", api_url=bot.api_url,
+            )
+    else:
+        # Fallback: direct execution (shouldn't happen in production)
+        try:
+            runner = get_runner_for_bot(bot)
+            result = await runner.run(
+                prompt,
+                new_session=True,
+                bypass_permissions=True,
+                system_prompt=bot.system_prompt,
+                mcp_config=bot.mcp_config_path,
+            )
+            header = f"📧 <b>Email +claude traité</b>\n\nDe: {from_addr}\nSujet: {subject}\n\n"
+            await telegram.send_message(header, chat_id=bot.chat_id, parse_mode="HTML", api_url=bot.api_url)
+            if result.text:
+                await send_response(result.text, bot.chat_id, session_name="gtd", api_url=bot.api_url)
+            else:
+                await telegram.send_message("(pas de réponse)", chat_id=bot.chat_id, api_url=bot.api_url)
+        except Exception as e:
+            logger.exception("Email processing error")
+            await telegram.send_message(
+                f"❌ Erreur traitement email: <code>{e}</code>\nSujet: {subject}",
+                chat_id=bot.chat_id, parse_mode="HTML", api_url=bot.api_url,
+            )
 
 
 @app.post("/cron/{reminder_type}")
@@ -1217,31 +1289,37 @@ async def cron_reminder(reminder_type: str):
 async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
     """Process a cron reminder via Claude GTD."""
     logger.info(f"Processing cron reminder: {reminder_type}")
-    try:
-        runner = get_runner_for_bot(bot)
-        result = await runner.run(
-            prompt,
-            new_session=True,  # Don't resume interactive session
-            bypass_permissions=True,
-            system_prompt=bot.system_prompt,
-            mcp_config=bot.mcp_config_path,
+    if gtd_queue is not None:
+        item = QueueItem(
+            prompt=prompt,
+            source="cron",
+            chat_id=bot.chat_id,
+            new_session=True,
         )
-
-        if result.text:
-            await send_response(
-                result.text,
-                bot.chat_id,
-                session_name="gtd",
+        added = await gtd_queue.enqueue(item)
+        if not added:
+            logger.warning(f"Queue full, skipping cron {reminder_type}")
+    else:
+        # Fallback: direct execution
+        try:
+            runner = get_runner_for_bot(bot)
+            result = await runner.run(
+                prompt,
+                new_session=True,
+                bypass_permissions=True,
+                system_prompt=bot.system_prompt,
+                mcp_config=bot.mcp_config_path,
+            )
+            if result.text:
+                await send_response(result.text, bot.chat_id, session_name="gtd", api_url=bot.api_url)
+        except Exception as e:
+            logger.exception(f"Cron reminder error ({reminder_type})")
+            await telegram.send_message(
+                f"❌ Erreur rappel {reminder_type}: <code>{e}</code>",
+                chat_id=bot.chat_id,
+                parse_mode="HTML",
                 api_url=bot.api_url,
             )
-    except Exception as e:
-        logger.exception(f"Cron reminder error ({reminder_type})")
-        await telegram.send_message(
-            f"❌ Erreur rappel {reminder_type}: <code>{e}</code>",
-            chat_id=bot.chat_id,
-            parse_mode="HTML",
-            api_url=bot.api_url,
-        )
 
 
 @app.post("/test")
