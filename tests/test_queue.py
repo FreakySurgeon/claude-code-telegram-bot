@@ -4,12 +4,26 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from claude_telegram.queue import QueueItem, RequestQueue
+from claude_telegram.queue import QueueItem, RequestQueue, process_queue_item
+from claude_telegram.claude import ClaudeResult
 
 
 @pytest.fixture
 def queue():
     return RequestQueue(maxsize=3)
+
+
+@pytest.fixture
+def mock_bot():
+    """Create a mock GTD bot."""
+    bot = MagicMock()
+    bot.name = "gtd"
+    bot.chat_id = "12345"
+    bot.api_url = None
+    bot.system_prompt = None
+    bot.mcp_config_path = None
+    bot.multi_session = False
+    return bot
 
 
 def test_queue_item_creation():
@@ -78,3 +92,65 @@ async def test_drain_clears_queue(queue):
     count = queue.drain()
     assert count == 3
     assert queue.size == 0
+
+
+@pytest.mark.asyncio
+async def test_process_queue_item_success(mock_bot):
+    """Test processing a queue item successfully."""
+    item = QueueItem(prompt="Hello", source="telegram", chat_id="12345")
+    mock_runner = MagicMock()
+    mock_runner.run = AsyncMock(return_value=ClaudeResult(text="Response", permission_denials=[]))
+    mock_runner.short_name = "gtd"
+
+    # Patch at the source so lazy imports pick up mocks
+    with patch("claude_telegram.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}) as mock_tg_send, \
+         patch("claude_telegram.telegram.delete_message", new_callable=AsyncMock) as mock_tg_del, \
+         patch("claude_telegram.main.send_response", new_callable=AsyncMock) as mock_send, \
+         patch("claude_telegram.main.animate_status", new_callable=AsyncMock), \
+         patch("claude_telegram.main.get_thinking_message", return_value="✨ <i>Thinking...</i>"):
+        await process_queue_item(item, mock_runner, mock_bot)
+        mock_runner.run.assert_called_once()
+        mock_send.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_process_queue_item_timeout_retries(mock_bot):
+    """Test that timeout triggers a retry."""
+    item = QueueItem(prompt="Hello", source="telegram", chat_id="12345")
+    mock_runner = MagicMock()
+    mock_runner.run = AsyncMock(side_effect=TimeoutError("timed out"))
+    mock_runner.short_name = "gtd"
+
+    q = RequestQueue(maxsize=10)
+
+    with patch("claude_telegram.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}), \
+         patch("claude_telegram.telegram.delete_message", new_callable=AsyncMock), \
+         patch("claude_telegram.main.send_response", new_callable=AsyncMock), \
+         patch("claude_telegram.main.animate_status", new_callable=AsyncMock), \
+         patch("claude_telegram.main.get_thinking_message", return_value="✨ <i>Thinking...</i>"):
+        await process_queue_item(item, mock_runner, mock_bot, queue=q)
+
+    assert q.size == 1
+    retry_item = await q.dequeue()
+    assert retry_item.retry_count == 1
+    assert "[RETRY]" in retry_item.prompt
+
+
+@pytest.mark.asyncio
+async def test_process_queue_item_timeout_no_second_retry(mock_bot):
+    """Test that a retry item doesn't retry again."""
+    item = QueueItem(prompt="Hello", source="telegram", chat_id="12345", retry_count=1)
+    mock_runner = MagicMock()
+    mock_runner.run = AsyncMock(side_effect=TimeoutError("timed out"))
+    mock_runner.short_name = "gtd"
+
+    q = RequestQueue(maxsize=10)
+
+    with patch("claude_telegram.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}), \
+         patch("claude_telegram.telegram.delete_message", new_callable=AsyncMock), \
+         patch("claude_telegram.main.send_response", new_callable=AsyncMock), \
+         patch("claude_telegram.main.animate_status", new_callable=AsyncMock), \
+         patch("claude_telegram.main.get_thinking_message", return_value="✨ <i>Thinking...</i>"):
+        await process_queue_item(item, mock_runner, mock_bot, queue=q)
+
+    assert q.size == 0
