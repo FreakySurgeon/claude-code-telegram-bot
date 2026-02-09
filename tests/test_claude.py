@@ -250,3 +250,69 @@ async def test_run_with_allowed_tools(runner, mock_process):
         assert "--allowedTools" in call_args
         idx = call_args.index("--allowedTools")
         assert "Write:/tmp/*,Bash:echo *" in call_args[idx + 1]
+
+
+@pytest.mark.asyncio
+async def test_run_timeout_kills_process(runner, mock_process):
+    """Test that run() kills process after timeout."""
+    async def never_ending():
+        await asyncio.sleep(999)
+        return
+        yield  # make it an async generator
+
+    mock_process.stdout = never_ending()
+    mock_process.returncode = -15
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_process):
+        with pytest.raises(TimeoutError):
+            await runner.run("Hello", timeout=0.1)
+
+    mock_process.terminate.assert_called()
+    assert runner.current_process is None
+
+
+@pytest.mark.asyncio
+async def test_run_timeout_escalates_to_sigkill(runner, mock_process):
+    """Test that run() escalates to SIGKILL if SIGTERM doesn't work."""
+    async def never_ending():
+        await asyncio.sleep(999)
+        return
+        yield
+
+    mock_process.stdout = never_ending()
+    mock_process.wait = AsyncMock(side_effect=asyncio.TimeoutError)
+    mock_process.kill = MagicMock()
+    mock_process.returncode = -9
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_process):
+        with pytest.raises(TimeoutError):
+            await runner.run("Hello", timeout=0.1)
+
+    mock_process.terminate.assert_called()
+    mock_process.kill.assert_called()
+    assert runner.current_process is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_escalates_to_sigkill(runner, mock_process):
+    """Test that cancel() escalates to SIGKILL if SIGTERM fails."""
+    runner.current_process = mock_process
+    mock_process.wait = AsyncMock(side_effect=asyncio.TimeoutError)
+    mock_process.kill = MagicMock()
+
+    result = await runner.cancel()
+
+    assert result is True
+    mock_process.terminate.assert_called()
+    mock_process.kill.assert_called()
+    assert runner.current_process is None
+
+
+@pytest.mark.asyncio
+async def test_run_default_timeout(runner, mock_process):
+    """Test that run() uses default 300s timeout and completes normally."""
+    mock_process.stdout = async_iter(make_stream_json("OK"))
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_process):
+        result = await runner.run("Hello")
+        assert result.text == "OK"

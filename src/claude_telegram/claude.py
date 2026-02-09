@@ -188,6 +188,7 @@ class ClaudeRunner:
         bypass_permissions: bool = False,
         system_prompt: str | None = None,
         mcp_config: str | None = None,
+        timeout: float = 300,
     ) -> ClaudeResult:
         """
         Run Claude Code with a message.
@@ -201,6 +202,7 @@ class ClaudeRunner:
             bypass_permissions: If True, skip all permission prompts
             system_prompt: Optional system prompt to append (e.g., GTD bot)
             mcp_config: Optional path to MCP config file
+            timeout: Timeout in seconds (default 300s / 5 minutes)
 
         Returns:
             ClaudeResult with response text and any permission denials
@@ -260,6 +262,26 @@ class ClaudeRunner:
             env=env,
         )
 
+        try:
+            return await asyncio.wait_for(
+                self._execute(on_output=on_output, new_session=new_session),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            await self._force_kill()
+            raise TimeoutError(f"Claude process timed out after {timeout}s")
+
+    async def compact(self) -> ClaudeResult:
+        """Run compaction on the current session."""
+        return await self.run("/compact", continue_session=True)
+
+    async def _execute(
+        self,
+        *,
+        on_output: callable = None,
+        new_session: bool = False,
+    ) -> ClaudeResult:
+        """Internal: read stdout, wait for process, and return result."""
         # Parse stream-json output
         result_text = ""
         permission_denials = []
@@ -321,16 +343,26 @@ class ClaudeRunner:
             session_id=run_session_id,
         )
 
-    async def compact(self) -> ClaudeResult:
-        """Run compaction on the current session."""
-        return await self.run("/compact", continue_session=True)
+    async def _force_kill(self):
+        """Kill the current process with SIGTERM -> SIGKILL escalation."""
+        if not self.current_process:
+            return
+        proc = self.current_process
+        self.current_process = None
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=3)
+        except asyncio.TimeoutError:
+            proc.kill()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                pass
 
     async def cancel(self) -> bool:
         """Cancel the currently running Claude process."""
         if self.current_process:
-            self.current_process.terminate()
-            await self.current_process.wait()
-            self.current_process = None
+            await self._force_kill()
             return True
         return False
 
