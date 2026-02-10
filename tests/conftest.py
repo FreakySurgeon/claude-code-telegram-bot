@@ -9,6 +9,14 @@ os.environ["TELEGRAM_BOT_TOKEN"] = "test_token_123"
 os.environ["TELEGRAM_CHAT_ID"] = "12345"
 os.environ["CLAUDE_CLI_PATH"] = "claude"
 os.environ["CLAUDE_WORKING_DIR"] = "/tmp/test"
+# GTD bot env vars (optional, can be empty)
+os.environ.setdefault("GTD_BOT_TOKEN", "")
+os.environ.setdefault("GTD_CHAT_ID", "")
+os.environ.setdefault("GTD_WORKING_DIR", "")
+os.environ.setdefault("GTD_PROMPT_PATH", "")
+os.environ.setdefault("GTD_MCP_CONFIG", "")
+os.environ.setdefault("MISTRAL_API_KEY", "")
+os.environ.setdefault("WEBHOOK_SECRET", "")
 
 
 @pytest.fixture
@@ -23,6 +31,13 @@ def mock_settings():
         mock.port = 8000
         mock.webhook_path = "/webhook"
         mock.webhook_url = None
+        mock.gtd_bot_token = None
+        mock.gtd_chat_id = None
+        mock.gtd_working_dir = None
+        mock.gtd_prompt_path = None
+        mock.gtd_mcp_config = None
+        mock.mistral_api_key = None
+        mock.webhook_secret = None
         yield mock
 
 
@@ -45,6 +60,38 @@ def mock_subprocess():
         process.wait = AsyncMock(return_value=0)
         mock.return_value = process
         yield mock, process
+
+
+@pytest.fixture
+def dev_bot():
+    """Create a dev BotConfig for testing."""
+    from claude_telegram.bots import BotConfig
+    return BotConfig(
+        name="dev",
+        token="test_token_123",
+        chat_id="12345",
+        multi_session=True,
+        commands_whitelist=[
+            "/start", "/help", "/c", "/continue", "/new", "/dir", "/dirs",
+            "/repos", "/rmdir", "/compact", "/cancel", "/status",
+        ],
+    )
+
+
+@pytest.fixture
+def gtd_bot():
+    """Create a GTD BotConfig for testing."""
+    from claude_telegram.bots import BotConfig
+    return BotConfig(
+        name="gtd",
+        token="gtd_test_token",
+        chat_id="67890",
+        fixed_working_dir="/tmp/gtd",
+        multi_session=False,
+        commands_whitelist=[
+            "/start", "/help", "/new", "/compact", "/cancel", "/status",
+        ],
+    )
 
 
 @pytest.fixture

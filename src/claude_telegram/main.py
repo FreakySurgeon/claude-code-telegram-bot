@@ -1255,6 +1255,7 @@ async def _process_email(data: dict, bot: BotConfig):
             source="email",
             chat_id=bot.chat_id,
             new_session=True,
+            timeout=600,  # 10 min for email (MCP-heavy: Gmail + Trello + GDrive)
             metadata={"subject": subject, "from": from_addr},
         )
         added = await gtd_queue.enqueue(item)
@@ -1314,6 +1315,7 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
             source="cron",
             chat_id=bot.chat_id,
             new_session=True,
+            timeout=600,  # 10 min for cron (MCP-heavy: Trello + Calendar)
         )
         added = await gtd_queue.enqueue(item)
         if not added:

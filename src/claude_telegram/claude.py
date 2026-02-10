@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -260,6 +261,7 @@ class ClaudeRunner:
             stderr=asyncio.subprocess.STDOUT,
             cwd=cwd,
             env=env,
+            start_new_session=True,  # Own process group so we can kill MCP children too
         )
 
         try:
@@ -344,16 +346,25 @@ class ClaudeRunner:
         )
 
     async def _force_kill(self):
-        """Kill the current process with SIGTERM -> SIGKILL escalation."""
+        """Kill the current process and its children (MCP servers) with SIGTERM -> SIGKILL."""
         if not self.current_process:
             return
         proc = self.current_process
         self.current_process = None
-        proc.terminate()
+        # Kill entire process group (Claude + MCP server children)
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            proc.terminate()
         try:
             await asyncio.wait_for(proc.wait(), timeout=3)
         except asyncio.TimeoutError:
-            proc.kill()
+            try:
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                proc.kill()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2)
             except asyncio.TimeoutError:

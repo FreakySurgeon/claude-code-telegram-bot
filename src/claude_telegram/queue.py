@@ -26,6 +26,7 @@ class QueueItem:
     bypass_permissions: bool = True
     new_session: bool = False
     allowed_tools: list[str] | None = None
+    timeout: float = 300  # seconds (5 min default, override for email/cron)
     # Retry state
     retry_count: int = 0
     original_error: str | None = None
@@ -45,6 +46,7 @@ class QueueItem:
             bypass_permissions=self.bypass_permissions,
             new_session=True,
             allowed_tools=self.allowed_tools,
+            timeout=self.timeout,
             retry_count=self.retry_count + 1,
             original_error=error,
         )
@@ -126,6 +128,7 @@ async def process_queue_item(
             bypass_permissions=item.bypass_permissions,
             system_prompt=getattr(bot, 'system_prompt', None),
             mcp_config=getattr(bot, 'mcp_config_path', None),
+            timeout=item.timeout,
         )
 
         # Stop animation + delete status
@@ -136,6 +139,8 @@ async def process_queue_item(
         if message_id:
             await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
 
+        logger.info(f"Queue item completed: {item.source} (retry={item.retry_count}), response length={len(result.text)}")
+
         # Send response
         if result.text:
             await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url)
@@ -143,6 +148,7 @@ async def process_queue_item(
             await telegram.send_message("<i>(pas de réponse)</i>", chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url)
 
     except TimeoutError as e:
+        logger.warning(f"Queue item timed out: {item.source} (retry={item.retry_count}, timeout={item.timeout}s)")
         # Stop animation
         if animation_task:
             animation_task.cancel()
@@ -154,8 +160,9 @@ async def process_queue_item(
         if item.can_retry and queue:
             retry_item = item.as_retry(str(e))
             await queue.enqueue(retry_item)
+            timeout_min = int(item.timeout // 60)
             await telegram.send_message(
-                "⏰ Timeout après 5min — retry automatique en cours...",
+                f"⏰ Timeout après {timeout_min}min — retry automatique en cours...",
                 chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url,
             )
         else:
