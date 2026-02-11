@@ -102,22 +102,25 @@ async def process_queue_item(
     from .main import send_response, animate_status, get_thinking_message
 
     session_name = runner.short_name
+    silent = item.source == "email"
 
-    # Send animated status
-    status = get_thinking_message()
-    status_msg = await telegram.send_message(
-        status,
-        chat_id=item.chat_id,
-        parse_mode="HTML",
-        api_url=bot.api_url,
-    )
-    message_id = status_msg.get("result", {}).get("message_id")
-
+    # Send animated status (skip for emails — no Telegram notification)
+    message_id = None
     animation_task = None
-    if message_id:
-        animation_task = asyncio.create_task(
-            animate_status(item.chat_id, message_id, item.continue_session, session_name, api_url=bot.api_url)
+    if not silent:
+        status = get_thinking_message()
+        status_msg = await telegram.send_message(
+            status,
+            chat_id=item.chat_id,
+            parse_mode="HTML",
+            api_url=bot.api_url,
         )
+        message_id = status_msg.get("result", {}).get("message_id")
+
+        if message_id:
+            animation_task = asyncio.create_task(
+                animate_status(item.chat_id, message_id, item.continue_session, session_name, api_url=bot.api_url)
+            )
 
     try:
         result = await runner.run(
@@ -141,8 +144,14 @@ async def process_queue_item(
 
         logger.info(f"Queue item completed: {item.source} (retry={item.retry_count}), response length={len(result.text)}")
 
-        # Send response
-        if result.text:
+        # Send response (emails are silent unless urgent)
+        if silent:
+            if result.text and "Claude/Urgent" in result.text:
+                await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url)
+            else:
+                subject = item.metadata.get("subject", "?")
+                logger.info(f"Email triage silent (no Telegram): {subject}")
+        elif result.text:
             await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url)
         else:
             await telegram.send_message("<i>(pas de réponse)</i>", chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url)
@@ -160,16 +169,18 @@ async def process_queue_item(
         if item.can_retry and queue:
             retry_item = item.as_retry(str(e))
             await queue.enqueue(retry_item)
-            timeout_min = int(item.timeout // 60)
-            await telegram.send_message(
-                f"⏰ Timeout après {timeout_min}min — retry automatique en cours...",
-                chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url,
-            )
+            if not silent:
+                timeout_min = int(item.timeout // 60)
+                await telegram.send_message(
+                    f"⏰ Timeout après {timeout_min}min — retry automatique en cours...",
+                    chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url,
+                )
         else:
-            await telegram.send_message(
-                "❌ Échec après 2 tentatives (timeout). Requête abandonnée.",
-                chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url,
-            )
+            if not silent:
+                await telegram.send_message(
+                    "❌ Échec après 2 tentatives (timeout). Requête abandonnée.",
+                    chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url,
+                )
 
     except Exception as e:
         if animation_task:
@@ -180,7 +191,8 @@ async def process_queue_item(
             await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
 
         logger.exception("Queue item processing error")
-        await telegram.send_message(
-            f"❌ <b>Erreur:</b> <code>{e}</code>",
-            chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url,
-        )
+        if not silent:
+            await telegram.send_message(
+                f"❌ <b>Erreur:</b> <code>{e}</code>",
+                chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url,
+            )

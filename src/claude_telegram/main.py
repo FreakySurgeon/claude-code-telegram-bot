@@ -237,7 +237,7 @@ async def lifespan(app: FastAPI):
     # Start GTD queue worker
     gtd_bot_instance = bots.get("gtd")
     if gtd_bot_instance:
-        gtd_queue = RequestQueue(maxsize=10)
+        gtd_queue = RequestQueue(maxsize=30)
         queue_worker_task = asyncio.create_task(queue_worker(gtd_queue, gtd_bot_instance))
 
     yield
@@ -359,7 +359,7 @@ async def handle_message(message: dict, bot: BotConfig):
         added = await gtd_queue.enqueue(item)
         if not added:
             await telegram.send_message(
-                "⚠️ Queue pleine (10 max), réessaie plus tard",
+                "⚠️ Queue pleine (30 max), réessaie plus tard",
                 chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
             )
         elif gtd_queue.size > 1:
@@ -418,7 +418,7 @@ async def handle_voice(message: dict, bot: BotConfig):
                 added = await gtd_queue.enqueue(item)
                 if not added:
                     await telegram.send_message(
-                        "⚠️ Queue pleine (10 max), réessaie plus tard",
+                        "⚠️ Queue pleine (30 max), réessaie plus tard",
                         chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
                     )
                 elif gtd_queue.size > 1:
@@ -1227,26 +1227,52 @@ async def email_webhook(request: Request):
 
 
 async def _process_email(data: dict, bot: BotConfig):
-    """Process an incoming email via Claude GTD."""
+    """Process an incoming email via Claude GTD triage."""
     from_addr = data.get("from", "unknown")
     subject = data.get("subject", "(no subject)")
-    body = data.get("body", "")[:2000]
+    body = data.get("body", "")[:4000]
     date = data.get("date", "")
+    cc = data.get("cc", "")
+    attachments = data.get("attachments", [])
+    has_draft = data.get("hasDraft", False)
+    is_from_thomas = data.get("isFromThomas", False)
+    email_message_id = data.get("messageId", "")
+    thread_id = data.get("threadId", "")
 
-    logger.info(f"Processing email: '{subject}' from {from_addr}")
+    logger.info(f"Processing email triage: '{subject}' from {from_addr} (fromThomas={is_from_thomas}, hasDraft={has_draft})")
+
+    # Build attachment info
+    attachment_info = ""
+    if attachments:
+        att_lines = []
+        for att in attachments:
+            att_lines.append(f"  - {att.get('name', '?')} ({att.get('mimeType', '?')}, {att.get('size', 0)} bytes)")
+        attachment_info = f"\n**Pièces jointes** :\n" + "\n".join(att_lines) + "\n"
+
+    # Build draft info
+    draft_info = ""
+    if has_draft:
+        draft_info = "\n**⚠️ Un brouillon de réponse existe déjà dans ce thread** (probablement Jace). Lis-le via Gmail MCP avant de décider si tu dois en créer un autre.\n"
 
     prompt = (
-        f"📧 **EMAIL +CLAUDE REÇU** - Applique les règles de la section \"9. EMAILS ENTRANTS\" de ton prompt.\n\n"
+        f"📧 **TRIAGE EMAIL** - Applique les règles de la section \"Triage Email\" de ton prompt.\n\n"
         f"---\n"
         f"**De** : {from_addr}\n"
+        f"**À** : {data.get('to', '')}\n"
+        f"**CC** : {cc}\n"
         f"**Sujet** : {subject}\n"
-        f"**Date** : {date}\n\n"
+        f"**Date** : {date}\n"
+        f"**Message ID** : {email_message_id}\n"
+        f"**Thread ID** : {thread_id}\n"
+        f"**Email de Thomas** : {'OUI' if is_from_thomas else 'NON'}\n"
+        f"{attachment_info}"
+        f"{draft_info}\n"
         f"**Contenu** :\n{body}\n"
         f"---\n\n"
-        f"Traite cet email selon tes règles de catégorisation.\n"
-        f"IMPORTANT : Réponds aussi à l'expéditeur par email (utilise send_email via Gmail MCP) "
-        f"avec un résumé de ce que tu as fait.\n"
-        f"NE PAS relire l'email via Gmail, le contenu est ci-dessus."
+        f"Traite cet email selon les règles de triage.\n"
+        f"NE PAS relire l'email via Gmail, le contenu est ci-dessus.\n"
+        f"Tu peux par contre utiliser Gmail MCP pour : chercher dans le thread, lire les brouillons, "
+        f"télécharger les pièces jointes, envoyer le résumé, appliquer les labels."
     )
 
     if gtd_queue is not None:
@@ -1275,8 +1301,6 @@ async def _process_email(data: dict, bot: BotConfig):
                 system_prompt=bot.system_prompt,
                 mcp_config=bot.mcp_config_path,
             )
-            header = f"📧 <b>Email +claude traité</b>\n\nDe: {from_addr}\nSujet: {subject}\n\n"
-            await telegram.send_message(header, chat_id=bot.chat_id, parse_mode="HTML", api_url=bot.api_url)
             if result.text:
                 await send_response(result.text, bot.chat_id, session_name="gtd", api_url=bot.api_url)
             else:
