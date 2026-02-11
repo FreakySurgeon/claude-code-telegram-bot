@@ -259,6 +259,7 @@ class ClaudeRunner:
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            limit=1024 * 1024,  # 1 MiB line buffer (default 64 KiB too small for large Claude JSON events)
             cwd=cwd,
             env=env,
             start_new_session=True,  # Own process group so we can kill MCP children too
