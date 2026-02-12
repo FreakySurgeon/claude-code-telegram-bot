@@ -1,6 +1,7 @@
 """FastAPI application - Telegram webhook handler."""
 
 import asyncio
+import html
 import logging
 import random
 import re
@@ -1011,19 +1012,19 @@ async def send_permission_request(
     for d in result.permission_denials:
         tool = d.tool_name
         if tool == "Write":
-            path = d.tool_input.get("file_path", "unknown")
+            path = html.escape(d.tool_input.get("file_path", "unknown"))
             denial_lines.append(f"• <b>Write</b> to <code>{path}</code>")
         elif tool == "Bash":
-            cmd = d.tool_input.get("command", "unknown")[:60]
+            cmd = html.escape(d.tool_input.get("command", "unknown")[:60])
             denial_lines.append(f"• <b>Bash</b>: <code>{cmd}</code>")
         elif tool == "Edit":
-            path = d.tool_input.get("file_path", "unknown")
+            path = html.escape(d.tool_input.get("file_path", "unknown"))
             denial_lines.append(f"• <b>Edit</b> <code>{path}</code>")
         elif tool == "Read":
-            path = d.tool_input.get("file_path", "unknown")
+            path = html.escape(d.tool_input.get("file_path", "unknown"))
             denial_lines.append(f"• <b>Read</b> <code>{path}</code>")
         else:
-            denial_lines.append(f"• <b>{tool}</b>: {str(d.tool_input)[:50]}")
+            denial_lines.append(f"• <b>{html.escape(tool)}</b>: {html.escape(str(d.tool_input)[:50])}")
 
     # Store pending request for retry
     pending_permissions[str(chat_id)] = {
@@ -1041,7 +1042,7 @@ async def send_permission_request(
 
     # Also show partial result if any
     if result.text.strip():
-        msg += f"\n\n<i>{result.text[:500]}</i>"
+        msg += f"\n\n<i>{html.escape(result.text[:500])}</i>"
 
     # Check if original session was in bypass mode
     permission_mode = get_session_permission_mode(session_dir)
@@ -1062,13 +1063,24 @@ async def send_permission_request(
         ])
         msg += "\n\n<i>Original session was in bypass mode.</i>"
 
-    await telegram.send_message(
-        msg,
-        chat_id=chat_id,
-        parse_mode="HTML",
-        reply_markup=buttons,
-        api_url=bot.api_url,
-    )
+    try:
+        await telegram.send_message(
+            msg,
+            chat_id=chat_id,
+            parse_mode="HTML",
+            reply_markup=buttons,
+            api_url=bot.api_url,
+        )
+    except Exception:
+        # Fallback to plain text if HTML parsing fails
+        logger.warning("Permission denial HTML failed, falling back to plain text")
+        await telegram.send_message(
+            msg,
+            chat_id=chat_id,
+            parse_mode=None,
+            reply_markup=buttons,
+            api_url=bot.api_url,
+        )
 
 
 async def send_response(text: str, chat_id: str, chunk_size: int = 4000, session_name: str = "default", api_url: str | None = None):

@@ -287,6 +287,7 @@ class ClaudeRunner:
         """Internal: read stdout, wait for process, and return result."""
         # Parse stream-json output
         result_text = ""
+        accumulated_text = ""
         permission_denials = []
         result_session_id = None
 
@@ -312,11 +313,14 @@ class ClaudeRunner:
                         ))
 
                 # Stream assistant text content for real-time output
-                if event_type == "assistant" and on_output:
+                if event_type == "assistant":
                     content = event.get("message", {}).get("content", [])
                     for c in content:
                         if isinstance(c, dict) and c.get("type") == "text":
-                            await on_output(c.get("text", ""))
+                            text = c.get("text", "")
+                            accumulated_text += text
+                            if on_output:
+                                await on_output(text)
 
             except json.JSONDecodeError:
                 # Not JSON, might be stderr or other output
@@ -341,7 +345,7 @@ class ClaudeRunner:
             logger.info(f"Session ID for {self.short_name}: {run_session_id}")
 
         return ClaudeResult(
-            text=result_text,
+            text=result_text or accumulated_text,
             permission_denials=permission_denials,
             session_id=run_session_id,
         )
