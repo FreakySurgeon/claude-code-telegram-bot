@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     gtd_working_dir: str | None = None
     gtd_prompt_path: str | None = None
     gtd_mcp_config: str | None = None
+    gtd_cron_prompts_dir: str | None = None
+    gtd_post_session_prompt: str | None = None
 
     # Transcription
     mistral_api_key: str | None = None

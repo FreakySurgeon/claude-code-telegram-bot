@@ -34,115 +34,35 @@ SPINNER_VERBS = [
     "Wandering", "Whirring", "Wibbling", "Wizarding", "Working", "Wrangling",
 ]
 
-CRON_PROMPTS = {
-    "morning": (
-        "C'est le briefing automatique du matin.\n\n"
-        "Effectue ces actions dans l'ordre :\n"
-        "1. Récupère l'heure actuelle et le jour de la semaine avec get-current-time\n"
-        "2. Lis `scripts/context/planning.md` pour connaître le programme type de ce jour\n"
-        "3. Lis `scripts/context/faits-recents.md` pour le contexte récent\n"
-        "4. Lis l'agenda Google Calendar pour aujourd'hui (calendriers: chauvet.t@gmail.com, Planning, Gardes HE)\n"
-        "5. Lis les tâches Trello : 'En cours', 'à faire', 'En attente'\n"
-        "6. Lis `scripts/context/_index.md` puis les fichiers projets des tâches En cours\n\n"
-        "Génère un **briefing actionnable** (PAS une simple liste) avec ce format :\n\n"
-        "☀️ Bonjour Thomas — [Jour] [Date]\n\n"
-        "📅 Aujourd'hui : [résumé du programme selon planning.md + calendar]\n"
-        "Tu as ~[X]h de libre [créneau].\n\n"
-        "🎯 Top 3 actions du jour :\n"
-        "1. [emoji type] [Action concrète et spécifique]\n"
-        "   → [Détails pré-mâchés : numéro de tel, brouillon prêt, PR à merger...]\n"
-        "   → [Estimation temps]\n"
-        "2. ...\n"
-        "3. ...\n\n"
-        "[Si tâche > 14 jours sans mouvement :]\n"
-        "⚠️ Blocage détecté :\n"
-        "[Tâche] est en plan depuis [X] jours.\n"
-        "  a) [Option 1]\n"
-        "  b) [Option 2]\n"
-        "  c) Reporter\n\n"
-        "[Si fait récent intéressant :]\n"
-        "💡 Fait récent : [info de faits-recents.md]\n\n"
-        "Réponds si tu veux ajuster !\n\n"
-        "IMPORTANT :\n"
-        "- Croise le jour (planning.md) avec les tâches pour proposer des actions ADAPTÉES au créneau\n"
-        "- Mardi = bloc opératoire → NE RIEN proposer, juste souhaiter bon bloc\n"
-        "- Pré-mâche au maximum : numéro de téléphone, nom du contact, lien, brouillon prêt\n"
-        "- Estime le temps de chaque action\n"
-        "- Détecte les tâches qui stagnent (> 14j) et propose des options\n"
-        "- Si une action est déjà prête (brouillon email, PR avec tests OK), mentionne-le\n"
-        "- Le message doit tenir sur un écran de téléphone\n"
-        "- Logge le briefing dans journal-agent.md avec type [CRON]"
-    ),
-    "evening": (
-        "C'est le debrief automatique du soir.\n\n"
-        "Effectue ces actions dans l'ordre :\n"
-        "1. Récupère l'heure actuelle et le jour avec get-current-time\n"
-        "2. Lis `scripts/context/journal-agent.md` — section du jour pour voir ce qui a été fait\n"
-        "3. Lis `scripts/context/faits-recents.md` pour les faits appris aujourd'hui\n"
-        "4. Lis les tâches Trello 'En cours' et 'Inbox' (non traitées)\n"
-        "5. Lis l'agenda Google Calendar pour demain\n"
-        "6. Vérifie le jour (vendredi/samedi → rappel weekly review)\n\n"
-        "Génère un **debrief rapide** avec ce format :\n\n"
-        "🌙 Bilan [Jour] [Date]\n\n"
-        "✅ Fait aujourd'hui :\n"
-        "- [Actions complétées, tirées du journal-agent.md et Trello]\n\n"
-        "[Si tâches restées en plan :]\n"
-        "📌 Resté en plan :\n"
-        "- [Tâche] → [Suggestion pour demain ou question]\n\n"
-        "[Si faits appris aujourd'hui :]\n"
-        "🧠 J'ai appris :\n"
-        "- [Fait retenu + dans quel fichier de contexte]\n\n"
-        "📅 Demain : [Résumé programme + premier RDV]\n\n"
-        "[Si vendredi/samedi : 📊 N'oublie pas la weekly review !]\n\n"
-        "Bonne soirée 🌟\n\n"
-        "IMPORTANT :\n"
-        "- Sois concis (le message doit tenir sur un écran de téléphone)\n"
-        "- Mets à jour `faits-recents.md` avec les faits significatifs appris aujourd'hui\n"
-        "- Logge le debrief dans `journal-agent.md` avec type [CRON]"
-    ),
-    "weekly": (
-        "C'est la weekly review automatique (dimanche matin).\n\n"
-        "Effectue ces actions dans l'ordre :\n"
-        "1. Récupère l'heure actuelle\n"
-        "2. Lis `scripts/context/journal-agent.md` — les 7 derniers jours\n"
-        "3. Lis toutes les listes Trello : Inbox, En attente, à faire, En cours, Si du temps...\n"
-        "4. Lis `scripts/context/faits-recents.md`\n"
-        "5. Lis `scripts/context/_index.md` puis les fichiers projets des tâches actives\n"
-        "6. Lis `scripts/context/planning.md` pour connaître les créneaux de la semaine\n"
-        "7. Lis l'agenda Google Calendar pour la semaine à venir\n\n"
-        "Génère une **weekly review orientée décision** avec ce format :\n\n"
-        "📋 Weekly Review — Dimanche [Date]\n\n"
-        "📊 Bilan semaine :\n"
-        "- [X] tâches créées, [Y] terminées, [Z] emails triés\n"
-        "- Taux de complétion : [Y/X]%\n\n"
-        "🚀 Projets actifs :\n"
-        "[Pour chaque projet avec tâche en cours ou à faire :]\n"
-        "• [Projet] : [statut 1 ligne] → Prochaine action : [action]\n\n"
-        "⚠️ Blocages (> 14 jours sans mouvement) :\n"
-        "[Pour chaque tâche bloquée :]\n"
-        "• [Tâche] — [X] jours. Tu veux :\n"
-        "  a) Continuer (prochaine action = ?)\n"
-        "  b) Reporter (someday/maybe)\n"
-        "  c) Abandonner\n\n"
-        "📅 Semaine prochaine :\n"
-        "[3-5 actions prioritaires mappées sur les créneaux dispo]\n"
-        "• Lundi matin : [action @ordi rapide]\n"
-        "• Jeudi matin : [action @ordi rapide]\n"
-        "• Vendredi : [action deepwork]\n\n"
-        "📬 Inbox : [X] éléments à trier\n"
-        "⏳ En attente : [X] tâches\n\n"
-        "Veux-tu qu'on traite les blocages ensemble maintenant ?\n\n"
-        "IMPORTANT :\n"
-        "- Après avoir généré le message, effectue la consolidation mémoire :\n"
-        "  1. Lis `faits-recents.md` : faits > 4 semaines → consolider dans fichiers domaine/projet\n"
-        "  2. Purger les faits consolidés ou obsolètes de `faits-recents.md`\n"
-        "  3. Mettre à jour `_index.md` si de nouveaux projets/domaines sont apparus\n"
-        "  4. Archiver les entrées > 1 mois de `journal-agent.md`\n"
-        "- Le message doit être orienté décision, pas juste informatif\n"
-        "- Propose des actions concrètes mappées sur le planning de la semaine\n"
-        "- Logge la weekly review dans journal-agent.md avec type [CRON]"
-    ),
-}
+def _load_cron_prompt(reminder_type: str) -> str | None:
+    """Load a cron prompt from the configured directory, or return None."""
+    from .config import settings
+    if not settings.gtd_cron_prompts_dir:
+        return None
+    prompt_file = Path(settings.gtd_cron_prompts_dir) / f"{reminder_type}.txt"
+    try:
+        return prompt_file.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        logger.warning(f"Cron prompt file not found: {prompt_file}")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to read cron prompt {prompt_file}: {e}")
+        return None
+
+
+def _load_post_session_prompt() -> str | None:
+    """Load the post-session memory enrichment prompt, or return None."""
+    from .config import settings
+    if not settings.gtd_post_session_prompt:
+        return None
+    try:
+        return Path(settings.gtd_post_session_prompt).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        logger.warning(f"Post-session prompt file not found: {settings.gtd_post_session_prompt}")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to read post-session prompt: {e}")
+        return None
 
 def get_thinking_message() -> str:
     """Get a random thinking message with emoji."""
@@ -1379,7 +1299,7 @@ async def _process_email(data: dict, bot: BotConfig):
 @app.post("/cron/{reminder_type}")
 async def cron_reminder(reminder_type: str):
     """Handle cron reminders (morning/evening/weekly)."""
-    prompt = CRON_PROMPTS.get(reminder_type)
+    prompt = _load_cron_prompt(reminder_type)
     if not prompt:
         return {"error": f"Unknown reminder type: {reminder_type}"}
 
