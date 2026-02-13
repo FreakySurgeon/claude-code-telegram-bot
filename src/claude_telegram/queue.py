@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Literal
 
 logger = logging.getLogger(__name__)
@@ -155,6 +156,35 @@ async def process_queue_item(
             await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url)
         else:
             await telegram.send_message("<i>(pas de réponse)</i>", chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url)
+
+        # --- GTD v2: Post-session memory enrichment ---
+        # After user conversations with substantial responses, ask agent to extract facts
+        if item.source == "telegram" and result.text and len(result.text) > 100:
+            try:
+                await runner.run(
+                    (
+                        "Tu viens de terminer une conversation avec Thomas. "
+                        "Effectue ces actions SILENCIEUSEMENT (ne génère PAS de message Telegram) :\n"
+                        "1. Si des faits nouveaux ont été appris, ajoute-les dans "
+                        "`scripts/context/faits-recents.md` : `- YYYY-MM-DD: [fait] (source: conversation)`\n"
+                        "2. Mets à jour le fichier domaine/projet si pertinent\n"
+                        "3. Ne fais RIEN si la conversation était triviale\n"
+                        "Réponds juste 'OK'."
+                    ),
+                    continue_session=True,
+                    bypass_permissions=True,
+                    system_prompt=getattr(bot, 'system_prompt', None),
+                    timeout=120,
+                )
+            except Exception:
+                logger.warning("Session memory summary failed", exc_info=True)
+
+        # --- GTD v2: Cron/email session continuity ---
+        # Save session so user replies within 10min can resume the conversation
+        if item.source in ("cron", "email") and result.text:
+            runner.last_interaction = datetime.now()
+            if result.session_id:
+                runner.session_id = result.session_id
 
     except TimeoutError as e:
         logger.warning(f"Queue item timed out: {item.source} (retry={item.retry_count}, timeout={item.timeout}s)")
