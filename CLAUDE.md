@@ -25,6 +25,7 @@ Unified Telegram bot for Claude Code Remote + GTD Assistant.
 │  POST /cron/morning    → 6h daily briefing                      │
 │  POST /cron/evening    → 18h day review                         │
 │  POST /cron/weekly     → Sunday weekly review                   │
+│  POST /cron/whatsapp   → */15min WhatsApp triage                │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -82,7 +83,8 @@ HOOK_SERVER_URL=http://localhost:8000
 |---------|----------|
 | Sessions | Multi-directory (`/dir`, `/dirs`, `/repos`) |
 | Permissions | Interactive UI (Allow/Deny buttons) |
-| Voice | Transcribe → show text → "Send to Claude" button |
+| Voice | Transcribe → show text → "Send to Claude" button (full text stored in memory, not callback_data) |
+| Photos | Download → send path to Claude for vision analysis |
 | Commands | `/start`, `/help`, `/c`, `/continue`, `/new`, `/dir`, `/dirs`, `/repos`, `/rmdir`, `/compact`, `/cancel`, `/status` |
 
 ### GTD Bot (FreakyMex-Personal-Org)
@@ -93,8 +95,14 @@ HOOK_SERVER_URL=http://localhost:8000
 | Permissions | Bypass (dangerous mode) |
 | Voice | Transcribe → process immediately |
 | System Prompt | Loaded from `GTD_PROMPT_PATH` |
-| MCP | Trello, Gmail, Calendar, GitHub, Playwright |
+| MCP | Trello, Gmail, Calendar, GitHub, Playwright, WhatsApp |
 | Commands | `/start`, `/help`, `/new`, `/compact`, `/cancel`, `/status` |
+
+## Silent Cron Handling
+
+WhatsApp scan cron (`/cron/whatsapp`) is **silent**: no "thinking" animation, result sent only if meaningful (>20 chars).
+Other crons (morning, evening, weekly) send their results normally.
+Logic: `queue.py` checks `item.metadata.get("reminder_type") == "whatsapp"` to determine silence.
 
 ## Cron Reminders
 
@@ -102,9 +110,10 @@ HOOK_SERVER_URL=http://localhost:8000
 0 6 * * * curl -s -X POST http://localhost:8000/cron/morning > /dev/null 2>&1
 0 18 * * * curl -s -X POST http://localhost:8000/cron/evening > /dev/null 2>&1
 0 10 * * 0 curl -s -X POST http://localhost:8000/cron/weekly > /dev/null 2>&1
+*/15 * * * * curl -s -X POST http://localhost:8000/cron/whatsapp > /dev/null 2>&1
 ```
 
-Prompts are defined in `main.py:CRON_PROMPTS` dict.
+Prompts are loaded from `GTD_CRON_PROMPTS_DIR/{name}.txt` (configured in `.env`).
 
 ## Email Webhook
 
