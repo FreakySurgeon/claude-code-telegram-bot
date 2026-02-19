@@ -103,7 +103,7 @@ async def process_queue_item(
     from .main import send_response, animate_status, get_thinking_message
 
     session_name = runner.short_name
-    silent = item.source == "email"
+    silent = item.source == "email" or item.metadata.get("reminder_type") == "whatsapp"
 
     # Send animated status (skip for emails — no Telegram notification)
     message_id = None
@@ -145,9 +145,16 @@ async def process_queue_item(
 
         logger.info(f"Queue item completed: {item.source} (retry={item.retry_count}), response length={len(result.text)}")
 
-        # Send response (emails are silent unless urgent)
+        # Send response (silent sources: no "thinking" animation, selective output)
         if silent:
-            if result.text and "Claude/Urgent" in result.text:
+            reminder_type = item.metadata.get("reminder_type", "")
+            if reminder_type == "whatsapp":
+                # WhatsApp scan: send result only if Claude produced meaningful output
+                if result.text and len(result.text.strip()) > 20:
+                    await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url)
+                else:
+                    logger.info(f"WhatsApp scan silent (no meaningful output)")
+            elif result.text and "Claude/Urgent" in result.text:
                 await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url)
             else:
                 subject = item.metadata.get("subject", "?")

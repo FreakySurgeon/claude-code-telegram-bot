@@ -84,6 +84,9 @@ from .queue import QueueItem, RequestQueue, process_queue_item
 # Store pending permission requests for retry
 pending_permissions: dict[str, dict] = {}  # chat_id -> {message, denials, session_key, bot_name}
 
+# Store pending voice transcription texts (callback_data limited to 64 bytes)
+pending_voice_texts: dict[str, str] = {}  # chat_id -> full transcription text
+
 # Bot configurations (initialized at startup)
 bots: dict[str, BotConfig] = {}
 
@@ -304,6 +307,13 @@ async def handle_message(message: dict, bot: BotConfig):
         await handle_voice(message, bot)
         return
 
+    # Handle photo messages (compressed photos or image documents)
+    photo = message.get("photo")
+    document = message.get("document")
+    if photo or (document and document.get("mime_type", "").startswith("image/")):
+        await handle_photo(message, bot)
+        return
+
     text = message.get("text", "")
     if not text:
         return
@@ -402,23 +412,103 @@ async def handle_voice(message: dict, bot: BotConfig):
                 await run_claude(transcription_prompt, chat_id, bot, continue_session=False)
         else:
             # For Dev bot: show transcription with button to process
-            # Truncate text for callback_data (max 64 bytes)
-            truncated = result.text[:180] if len(result.text) > 180 else result.text
+            # Store full text in memory (callback_data limited to 64 bytes)
+            pending_voice_texts[chat_id] = f"[Transcription vocale ({result.duration_formatted}, {result.engine})]\n\n{result.text}"
             buttons = {"inline_keyboard": [[
-                {"text": "✅ Send to Claude", "callback_data": f"voice:{truncated}"},
+                {"text": "✅ Send to Claude", "callback_data": "voice:send"},
             ]]}
-            await telegram.send_message(
-                f"🎤 <b>Transcription</b> ({result.duration_formatted})\n\n{result.text}",
-                chat_id=chat_id,
-                parse_mode="HTML",
-                reply_markup=buttons,
-                api_url=bot.api_url,
-            )
+            full_text = f"🎤 <b>Transcription</b> ({html.escape(result.duration_formatted)})\n\n{html.escape(result.text)}"
+            chunks = split_text(full_text, 4000)
+            for i, chunk in enumerate(chunks):
+                is_last = i == len(chunks) - 1
+                await telegram.send_message(
+                    chunk,
+                    chat_id=chat_id,
+                    parse_mode="HTML",
+                    reply_markup=buttons if is_last else None,
+                    api_url=bot.api_url,
+                )
+                if not is_last:
+                    await asyncio.sleep(0.3)
 
     except Exception as e:
         logger.exception("Transcription error")
         await telegram.send_message(
-            f"❌ Transcription failed: <code>{e}</code>",
+            f"❌ Transcription failed: <code>{html.escape(str(e))}</code>",
+            chat_id=chat_id,
+            parse_mode="HTML",
+            api_url=bot.api_url,
+        )
+
+
+async def handle_photo(message: dict, bot: BotConfig):
+    """Handle photo/image messages — download and send to Claude for vision analysis."""
+    chat_id = str(message["chat"]["id"])
+    caption = message.get("caption", "")
+
+    # Get file_id: photo array (take largest) or document
+    photo = message.get("photo")
+    document = message.get("document")
+    if photo:
+        file_id = photo[-1]["file_id"]  # Largest resolution
+    else:
+        file_id = document["file_id"]
+
+    try:
+        # Download file from Telegram
+        file_info = await telegram.get_file(file_id, api_url=bot.api_url)
+        file_path = file_info["result"]["file_path"]
+        image_data = await telegram.download_file(file_path, api_url=bot.api_url)
+
+        # Save to temp file
+        import tempfile
+        suffix = Path(file_path).suffix or ".jpg"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, prefix="claude_photo_") as tmp:
+            tmp.write(image_data)
+            tmp_path = tmp.name
+
+        # Build prompt with image path
+        user_text = caption or "Analyse cette image."
+        image_prompt = f"[Image jointe : {tmp_path}]\n\n{user_text}"
+
+        # GTD bot: enqueue for sequential processing
+        if not bot.multi_session and gtd_queue is not None:
+            runner = get_runner_for_bot(bot)
+            continue_session = runner.is_in_conversation()
+            item = QueueItem(
+                prompt=image_prompt,
+                source="telegram",
+                chat_id=chat_id,
+                continue_session=continue_session,
+            )
+            added = await gtd_queue.enqueue(item)
+            if not added:
+                await telegram.send_message(
+                    "⚠️ Queue pleine (30 max), réessaie plus tard",
+                    chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                )
+                Path(tmp_path).unlink(missing_ok=True)
+            elif gtd_queue.size > 1:
+                await telegram.send_message(
+                    f"📥 Image reçue (position {gtd_queue.size} dans la file)",
+                    chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                )
+            # Note: temp file cleanup happens after Claude processes it.
+            # The queue worker will handle the prompt; the file persists until
+            # OS tmp cleanup or next reboot. This is acceptable for /tmp files.
+        else:
+            # Dev bot: direct execution
+            try:
+                runner = get_runner_for_bot(bot)
+                continue_session = runner.is_in_conversation()
+                await run_claude(image_prompt, chat_id, bot, continue_session=continue_session)
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
+
+    except Exception as e:
+        logger.exception("Photo processing error")
+        await telegram.send_message(
+            f"❌ Erreur traitement image: <code>{e}</code>",
             chat_id=chat_id,
             parse_mode="HTML",
             api_url=bot.api_url,
@@ -483,7 +573,7 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig):
                 "<code>/cancel</code> — Arrêter la tâche\n"
                 "<code>/status</code> — Vérifier le statut\n\n"
                 "<b>Tips</b>\n"
-                "• Écris ou envoie un vocal — je comprends tout\n"
+                "• Écris, envoie un vocal ou une photo — je comprends tout\n"
                 "• La conversation continue automatiquement",
                 chat_id=chat_id,
                 parse_mode="HTML",
@@ -729,8 +819,14 @@ async def handle_callback(callback: dict, bot: BotConfig):
         await run_claude(reply, str(chat_id), bot, continue_session=True)
 
     elif data.startswith("voice:"):
-        voice_text = data[6:]
-        await run_claude(voice_text, str(chat_id), bot, continue_session=False)
+        voice_text = pending_voice_texts.pop(str(chat_id), None)
+        if voice_text:
+            await run_claude(voice_text, str(chat_id), bot, continue_session=False)
+        else:
+            await telegram.send_message(
+                "⚠️ Transcription expirée, renvoie le message vocal.",
+                chat_id=str(chat_id), parse_mode="HTML", api_url=bot.api_url,
+            )
 
     elif data.startswith("dir:") or data.startswith("repo:"):
         # Handle both dir: and repo: callbacks the same way
@@ -1128,7 +1224,14 @@ def split_text(text: str, chunk_size: int) -> list[str]:
     current = ""
 
     for line in text.split("\n"):
-        if len(current) + len(line) + 1 > chunk_size:
+        if len(line) > chunk_size:
+            # Line itself exceeds chunk_size — flush current, then hard-split the line
+            if current:
+                chunks.append(current)
+                current = ""
+            for i in range(0, len(line), chunk_size):
+                chunks.append(line[i:i + chunk_size])
+        elif len(current) + len(line) + 1 > chunk_size:
             if current:
                 chunks.append(current)
             current = line
@@ -1323,6 +1426,7 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
             chat_id=bot.chat_id,
             new_session=True,
             timeout=600,  # 10 min for cron (MCP-heavy: Trello + Calendar)
+            metadata={"reminder_type": reminder_type},
         )
         added = await gtd_queue.enqueue(item)
         if not added:
