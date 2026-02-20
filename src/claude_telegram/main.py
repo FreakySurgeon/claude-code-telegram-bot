@@ -80,6 +80,7 @@ from .config import settings
 from .markdown import markdown_to_telegram_html
 from .tunnel import tunnel, CloudflareTunnel
 from .queue import QueueItem, RequestQueue, process_queue_item
+from .topic import generate_provisional_name, extract_title_from_response, generate_title_fallback, format_topic_name
 
 # Store pending permission requests for retry
 pending_permissions: dict[str, dict] = {}  # chat_id -> {message, denials, session_key, bot_name}
@@ -100,11 +101,12 @@ polling_tasks: list[asyncio.Task] = []
 gtd_queue: RequestQueue | None = None
 queue_worker_task: asyncio.Task | None = None
 
-def get_runner_for_bot(bot: BotConfig):
-    """Get the appropriate runner for a bot."""
-    if bot.fixed_working_dir:
-        return sessions.get_session(bot.fixed_working_dir)
-    return sessions.get_current_session()
+def get_runner(bot: BotConfig, thread_id: int = 0):
+    """Get the runner for a bot + thread combination."""
+    working_dir = bot.fixed_working_dir or sessions.default_dir
+    return sessions.get_session(working_dir, thread_id=thread_id)
+
+get_runner_for_bot = get_runner  # Backward compat
 
 
 def build_session_buttons(session_list: list, current) -> dict:
@@ -248,7 +250,7 @@ async def queue_worker(queue: RequestQueue, bot: BotConfig):
         try:
             item = await queue.dequeue()
             logger.info(f"Processing queued {item.source} request (retry={item.retry_count})")
-            runner = get_runner_for_bot(bot)
+            runner = get_runner(bot, thread_id=item.thread_id or 0)
             await process_queue_item(item, runner, bot, queue=queue)
         except asyncio.CancelledError:
             logger.info("Queue worker stopped")
@@ -264,13 +266,11 @@ app = FastAPI(title="Claude Telegram", lifespan=lifespan)
 @app.get("/health")
 async def health():
     """Health check endpoint."""
-    current = sessions.get_current_session()
     return {
         "status": "ok",
         "claude_running": sessions.any_running(),
-        "current_session": current.short_name,
-        "in_conversation": current.is_in_conversation(),
-        "active_sessions": len(sessions.sessions),
+        "active_sessions": sum(len(threads) for threads in sessions.sessions.values()),
+        "active_dirs": len(sessions.sessions),
         "queue_size": gtd_queue.size if gtd_queue else 0,
     }
 
@@ -296,6 +296,8 @@ async def webhook(request: Request):
 async def handle_message(message: dict, bot: BotConfig):
     """Process incoming Telegram message."""
     chat_id = str(message["chat"]["id"])
+    thread_id = message.get("message_thread_id")
+    is_topic_message = message.get("is_topic_message", False)
 
     if not bot.is_authorized(chat_id):
         logger.warning(f"Unauthorized access from chat_id: {chat_id} on bot {bot.name}")
@@ -304,14 +306,14 @@ async def handle_message(message: dict, bot: BotConfig):
     # Handle voice messages
     voice = message.get("voice") or message.get("audio")
     if voice:
-        await handle_voice(message, bot)
+        await handle_voice(message, bot, thread_id=thread_id)
         return
 
     # Handle photo messages (compressed photos or image documents)
     photo = message.get("photo")
     document = message.get("document")
     if photo or (document and document.get("mime_type", "").startswith("image/")):
-        await handle_photo(message, bot)
+        await handle_photo(message, bot, thread_id=thread_id)
         return
 
     text = message.get("text", "")
@@ -320,52 +322,75 @@ async def handle_message(message: dict, bot: BotConfig):
 
     # Handle commands
     if text.startswith("/"):
-        await handle_command(text, chat_id, bot)
+        await handle_command(text, chat_id, bot, thread_id=thread_id, is_topic_message=is_topic_message)
         return
 
-    # Check if it's a quick reply
-    quick_reply = is_quick_reply(text)
+    # --- Topic routing ---
+    # If message is in General (not a topic message), create a new topic
+    if not is_topic_message:
+        thread_id = await _create_topic_for_message(text, chat_id, bot)
 
-    # Auto-continue if current session is in conversation
-    runner = get_runner_for_bot(bot)
-    continue_session = runner.is_in_conversation() or quick_reply
+    # Route to handler
+    runner = get_runner(bot, thread_id=thread_id or 0)
+    continue_session = runner.is_in_conversation() or is_quick_reply(text)
 
-    # GTD bot: enqueue for sequential processing
-    if not bot.multi_session and gtd_queue is not None:
+    if bot.use_queue and gtd_queue is not None:
         item = QueueItem(
             prompt=text,
             source="telegram",
             chat_id=chat_id,
             continue_session=continue_session,
+            thread_id=thread_id,
         )
         added = await gtd_queue.enqueue(item)
         if not added:
             await telegram.send_message(
                 "⚠️ Queue pleine (30 max), réessaie plus tard",
                 chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
         elif gtd_queue.size > 1:
             await telegram.send_message(
                 f"📥 Message reçu (position {gtd_queue.size} dans la file)",
                 chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
         return
 
-    # Dev bot: direct execution (existing behavior)
-    await run_claude(text, chat_id, bot, continue_session=continue_session)
+    await run_claude(text, chat_id, bot, continue_session=continue_session, thread_id=thread_id)
 
 
-async def handle_voice(message: dict, bot: BotConfig):
+async def _create_topic_for_message(text: str, chat_id: str, bot: BotConfig) -> int:
+    """Create a new topic for a message sent in General."""
+    is_agent = bot.fixed_working_dir is not None
+    name = generate_provisional_name(text, is_agent=is_agent)
+    try:
+        result = await telegram.create_forum_topic(chat_id, name, api_url=bot.api_url)
+        thread_id = result["result"]["message_thread_id"]
+        logger.info(f"Created topic '{name}' (thread_id={thread_id})")
+        return thread_id
+    except Exception as e:
+        logger.error(f"Failed to create topic: {e}")
+        raise
+
+
+async def handle_voice(message: dict, bot: BotConfig, *, thread_id: int | None = None):
     """Handle voice/audio messages — transcribe and offer to process."""
     chat_id = str(message["chat"]["id"])
+    is_topic_message = message.get("is_topic_message", False)
     voice = message.get("voice") or message.get("audio")
     file_id = voice["file_id"]
+
+    # Topic routing: create topic if message is in General
+    if not is_topic_message:
+        thread_id = await _create_topic_for_message("Message vocal", chat_id, bot)
 
     await telegram.send_message(
         "🎤 <i>Transcription en cours...</i>",
         chat_id=chat_id,
         parse_mode="HTML",
         api_url=bot.api_url,
+        message_thread_id=thread_id,
     )
 
     try:
@@ -387,8 +412,8 @@ async def handle_voice(message: dict, bot: BotConfig):
         # Cleanup temp file
         Path(tmp_path).unlink(missing_ok=True)
 
-        # For GTD bot: process directly via Claude
-        if not bot.multi_session:
+        # For queued bot: process directly via Claude
+        if bot.use_queue:
             transcription_prompt = f"[Transcription vocale ({result.duration_formatted}, {result.engine})]\n\n{result.text}"
             if gtd_queue is not None:
                 item = QueueItem(
@@ -396,20 +421,23 @@ async def handle_voice(message: dict, bot: BotConfig):
                     source="telegram",
                     chat_id=chat_id,
                     continue_session=False,
+                    thread_id=thread_id,
                 )
                 added = await gtd_queue.enqueue(item)
                 if not added:
                     await telegram.send_message(
                         "⚠️ Queue pleine (30 max), réessaie plus tard",
                         chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                        message_thread_id=thread_id,
                     )
                 elif gtd_queue.size > 1:
                     await telegram.send_message(
                         f"📥 Message vocal reçu (position {gtd_queue.size} dans la file)",
                         chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                        message_thread_id=thread_id,
                     )
             else:
-                await run_claude(transcription_prompt, chat_id, bot, continue_session=False)
+                await run_claude(transcription_prompt, chat_id, bot, continue_session=False, thread_id=thread_id)
         else:
             # For Dev bot: show transcription with button to process
             # Store full text in memory (callback_data limited to 64 bytes)
@@ -427,6 +455,7 @@ async def handle_voice(message: dict, bot: BotConfig):
                     parse_mode="HTML",
                     reply_markup=buttons if is_last else None,
                     api_url=bot.api_url,
+                    message_thread_id=thread_id,
                 )
                 if not is_last:
                     await asyncio.sleep(0.3)
@@ -438,13 +467,19 @@ async def handle_voice(message: dict, bot: BotConfig):
             chat_id=chat_id,
             parse_mode="HTML",
             api_url=bot.api_url,
+            message_thread_id=thread_id,
         )
 
 
-async def handle_photo(message: dict, bot: BotConfig):
+async def handle_photo(message: dict, bot: BotConfig, *, thread_id: int | None = None):
     """Handle photo/image messages — download and send to Claude for vision analysis."""
     chat_id = str(message["chat"]["id"])
+    is_topic_message = message.get("is_topic_message", False)
     caption = message.get("caption", "")
+
+    # Topic routing: create topic if message is in General
+    if not is_topic_message:
+        thread_id = await _create_topic_for_message(caption or "Image", chat_id, bot)
 
     # Get file_id: photo array (take largest) or document
     photo = message.get("photo")
@@ -471,27 +506,30 @@ async def handle_photo(message: dict, bot: BotConfig):
         user_text = caption or "Analyse cette image."
         image_prompt = f"[Image jointe : {tmp_path}]\n\n{user_text}"
 
-        # GTD bot: enqueue for sequential processing
-        if not bot.multi_session and gtd_queue is not None:
-            runner = get_runner_for_bot(bot)
+        # Queued bot: enqueue for sequential processing
+        if bot.use_queue and gtd_queue is not None:
+            runner = get_runner(bot, thread_id=thread_id or 0)
             continue_session = runner.is_in_conversation()
             item = QueueItem(
                 prompt=image_prompt,
                 source="telegram",
                 chat_id=chat_id,
                 continue_session=continue_session,
+                thread_id=thread_id,
             )
             added = await gtd_queue.enqueue(item)
             if not added:
                 await telegram.send_message(
                     "⚠️ Queue pleine (30 max), réessaie plus tard",
                     chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                    message_thread_id=thread_id,
                 )
                 Path(tmp_path).unlink(missing_ok=True)
             elif gtd_queue.size > 1:
                 await telegram.send_message(
                     f"📥 Image reçue (position {gtd_queue.size} dans la file)",
                     chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                    message_thread_id=thread_id,
                 )
             # Note: temp file cleanup happens after Claude processes it.
             # The queue worker will handle the prompt; the file persists until
@@ -499,9 +537,9 @@ async def handle_photo(message: dict, bot: BotConfig):
         else:
             # Dev bot: direct execution
             try:
-                runner = get_runner_for_bot(bot)
+                runner = get_runner(bot, thread_id=thread_id or 0)
                 continue_session = runner.is_in_conversation()
-                await run_claude(image_prompt, chat_id, bot, continue_session=continue_session)
+                await run_claude(image_prompt, chat_id, bot, continue_session=continue_session, thread_id=thread_id)
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
 
@@ -512,6 +550,7 @@ async def handle_photo(message: dict, bot: BotConfig):
             chat_id=chat_id,
             parse_mode="HTML",
             api_url=bot.api_url,
+            message_thread_id=thread_id,
         )
 
 
@@ -527,7 +566,7 @@ def is_quick_reply(text: str) -> bool:
     return False
 
 
-async def handle_command(text: str, chat_id: str, bot: BotConfig):
+async def handle_command(text: str, chat_id: str, bot: BotConfig, *, thread_id: int | None = None, is_topic_message: bool = False):
     """Handle bot commands."""
     cmd = text.split()[0].lower()
     args = text[len(cmd):].strip()
@@ -539,11 +578,12 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig):
             chat_id=chat_id,
             parse_mode="HTML",
             api_url=bot.api_url,
+            message_thread_id=thread_id,
         )
         return
 
     if cmd == "/start" or cmd == "/help":
-        if bot.multi_session:
+        if not bot.use_queue:
             await telegram.send_message(
                 "<b>Claude Code</b> via Telegram\n\n"
                 "<b>Commands</b>\n"
@@ -563,6 +603,7 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig):
                 chat_id=chat_id,
                 parse_mode="HTML",
                 api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
         else:
             await telegram.send_message(
@@ -578,35 +619,52 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig):
                 chat_id=chat_id,
                 parse_mode="HTML",
                 api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
 
     elif cmd == "/c" or cmd == "/continue":
         if args:
-            await run_claude(args, chat_id, bot, continue_session=True)
+            await run_claude(args, chat_id, bot, continue_session=True, thread_id=thread_id)
         else:
             await telegram.send_message(
                 "Usage: <code>/c &lt;message&gt;</code>",
                 chat_id=chat_id,
                 parse_mode="HTML",
                 api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
 
     elif cmd == "/new":
         if args:
-            # Reset current session's conversation state
-            runner = get_runner_for_bot(bot)
-            runner.last_interaction = None
-            await run_claude(args, chat_id, bot, continue_session=False)
+            if is_topic_message and thread_id:
+                # In a topic: reset session for that thread
+                runner = get_runner(bot, thread_id=thread_id)
+                runner.last_interaction = None
+                await run_claude(args, chat_id, bot, continue_session=False, thread_id=thread_id)
+            else:
+                # In General: create a new topic
+                thread_id = await _create_topic_for_message(args, chat_id, bot)
+                await run_claude(args, chat_id, bot, continue_session=False, thread_id=thread_id)
         else:
             await telegram.send_message(
                 "Usage: <code>/new &lt;message&gt;</code>",
                 chat_id=chat_id,
                 parse_mode="HTML",
                 api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
 
     elif cmd == "/dir":
         if args:
+            if is_topic_message:
+                await telegram.send_message(
+                    "⚠️ Utilise General pour changer de répertoire.",
+                    chat_id=chat_id,
+                    parse_mode="HTML",
+                    api_url=bot.api_url,
+                    message_thread_id=thread_id,
+                )
+                return
             session = sessions.switch_session(args)
             status = "🔄 running" if session.is_running else "💤 idle"
             conv = "in conversation" if session.is_in_conversation() else "fresh"
@@ -625,11 +683,12 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig):
                 chat_id=chat_id,
                 parse_mode="HTML",
                 api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
         else:
             # Show session picker if sessions exist
             session_list = sessions.list_sessions()
-            current = get_runner_for_bot(bot)
+            current = get_runner(bot, thread_id=thread_id or 0)
             if len(session_list) > 1:
                 buttons = build_session_buttons(session_list, current)
                 await telegram.send_message(
@@ -640,6 +699,7 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig):
                     parse_mode="HTML",
                     reply_markup=buttons,
                     api_url=bot.api_url,
+                    message_thread_id=thread_id,
                 )
             else:
                 await telegram.send_message(
@@ -649,46 +709,41 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig):
                     chat_id=chat_id,
                     parse_mode="HTML",
                     api_url=bot.api_url,
+                    message_thread_id=thread_id,
                 )
 
     elif cmd == "/dirs":
-        session_list = sessions.list_sessions()
-        if not session_list:
+        dir_list = sessions.list_dirs()
+        if not dir_list:
             await telegram.send_message(
                 "No active sessions",
                 chat_id=chat_id,
                 parse_mode="HTML",
                 api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
         else:
-            current = get_runner_for_bot(bot)
-            lines = ["<b>Active Sessions</b>\n"]
-            for i, (dir_key, session) in enumerate(session_list, 1):
-                is_current = session == current
-                if session.is_running:
-                    status = "🔄"  # Running
-                elif is_current:
-                    status = "📍"  # Current/selected
-                else:
-                    status = "💤"  # Idle
-                lines.append(f"{i}. {status} <code>{session.short_name}</code>")
-            buttons = build_session_buttons(session_list, current)
+            lines = ["<b>Active Directories</b>\n"]
+            for i, (dir_key, thread_count) in enumerate(dir_list, 1):
+                short = Path(dir_key).name
+                lines.append(f"{i}. 📂 <code>{short}</code> ({thread_count} topic{'s' if thread_count != 1 else ''})")
             await telegram.send_message(
                 "\n".join(lines),
                 chat_id=chat_id,
                 parse_mode="HTML",
-                reply_markup=buttons,
                 api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
 
     elif cmd == "/compact":
-        runner = get_runner_for_bot(bot)
+        runner = get_runner(bot, thread_id=thread_id or 0)
         if runner.is_running:
             await telegram.send_message(
                 "⏳ Claude is busy — use <code>/cancel</code> first",
                 chat_id=chat_id,
                 parse_mode="HTML",
                 api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
             return
         await telegram.send_message(
@@ -696,46 +751,48 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig):
             chat_id=chat_id,
             parse_mode="HTML",
             api_url=bot.api_url,
+            message_thread_id=thread_id,
         )
         result = await runner.compact()
-        await send_response(result.text, chat_id, api_url=bot.api_url)
+        await send_response(result.text, chat_id, api_url=bot.api_url, message_thread_id=thread_id)
 
     elif cmd == "/cancel":
-        runner = get_runner_for_bot(bot)
+        runner = get_runner(bot, thread_id=thread_id or 0)
         cancelled = await runner.cancel()
         drained = 0
-        if gtd_queue and not bot.multi_session:
+        if gtd_queue and bot.use_queue:
             drained = gtd_queue.drain()
         if cancelled or drained:
             msg = f"🛑 Cancelled <code>{runner.short_name}</code>"
             if drained:
                 msg += f" + {drained} en file supprimé(s)"
-            await telegram.send_message(msg, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url)
+            await telegram.send_message(msg, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url, message_thread_id=thread_id)
         else:
-            await telegram.send_message("Nothing to cancel", chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url)
+            await telegram.send_message("Nothing to cancel", chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url, message_thread_id=thread_id)
 
     elif cmd == "/status":
-        runner = get_runner_for_bot(bot)
+        runner = get_runner(bot, thread_id=thread_id or 0)
         if runner.is_running:
             status = "🔄 <b>Running</b>"
         else:
             status = "💤 <b>Idle</b>"
         conv = "in conversation" if runner.is_in_conversation() else "new session"
         msg = f"📂 <code>{runner.short_name}</code>\n{status} • {conv}"
-        if gtd_queue and not bot.multi_session:
+        if gtd_queue and bot.use_queue:
             msg += f"\n📥 Queue: {gtd_queue.size} en attente"
-        await telegram.send_message(msg, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url)
+        await telegram.send_message(msg, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url, message_thread_id=thread_id)
 
     elif cmd == "/rmdir":
         if args:
             if sessions.remove_session(args):
-                current = get_runner_for_bot(bot)
+                current = get_runner(bot, thread_id=thread_id or 0)
                 await telegram.send_message(
                     f"🗑 Removed session <code>{args}</code>\n"
                     f"📍 Current: <code>{current.short_name}</code>",
                     chat_id=chat_id,
                     parse_mode="HTML",
                     api_url=bot.api_url,
+                    message_thread_id=thread_id,
                 )
             else:
                 await telegram.send_message(
@@ -744,6 +801,7 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig):
                     chat_id=chat_id,
                     parse_mode="HTML",
                     api_url=bot.api_url,
+                    message_thread_id=thread_id,
                 )
         else:
             await telegram.send_message(
@@ -751,6 +809,7 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig):
                 chat_id=chat_id,
                 parse_mode="HTML",
                 api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
 
     elif cmd == "/repos":
@@ -763,10 +822,11 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig):
                 chat_id=chat_id,
                 parse_mode="HTML",
                 api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
         else:
             # Build buttons for favorite repos
-            current = get_runner_for_bot(bot)
+            current = get_runner(bot, thread_id=thread_id or 0)
             buttons = []
             row = []
             for repo in favorites:
@@ -787,6 +847,7 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig):
                 parse_mode="HTML",
                 reply_markup={"inline_keyboard": buttons},
                 api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
 
     else:
@@ -796,6 +857,7 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig):
             chat_id=chat_id,
             parse_mode="HTML",
             api_url=bot.api_url,
+            message_thread_id=thread_id,
         )
 
 
@@ -816,12 +878,14 @@ async def handle_callback(callback: dict, bot: BotConfig):
 
     if data.startswith("reply:"):
         reply = data[6:]  # Remove "reply:" prefix
-        await run_claude(reply, str(chat_id), bot, continue_session=True)
+        callback_thread_id = callback["message"].get("message_thread_id", 0)
+        await run_claude(reply, str(chat_id), bot, continue_session=True, thread_id=callback_thread_id)
 
     elif data.startswith("voice:"):
         voice_text = pending_voice_texts.pop(str(chat_id), None)
         if voice_text:
-            await run_claude(voice_text, str(chat_id), bot, continue_session=False)
+            callback_thread_id = callback["message"].get("message_thread_id", 0)
+            await run_claude(voice_text, str(chat_id), bot, continue_session=False, thread_id=callback_thread_id)
         else:
             await telegram.send_message(
                 "⚠️ Transcription expirée, renvoie le message vocal.",
@@ -896,12 +960,14 @@ async def handle_callback(callback: dict, bot: BotConfig):
             api_url=bot.api_url,
         )
 
+        callback_thread_id = callback["message"].get("message_thread_id", 0)
         await run_claude(
             original_message,
             str(chat_id),
             bot,
             continue_session=True,
             allowed_tools=allowed_tools,
+            thread_id=callback_thread_id,
         )
 
     elif data == "perm:deny":
@@ -940,10 +1006,11 @@ async def handle_callback(callback: dict, bot: BotConfig):
         )
 
         # Retry with bypass permissions
-        await run_claude(original_message, str(chat_id), bot, continue_session=True, bypass_permissions=True)
+        callback_thread_id = callback["message"].get("message_thread_id", 0)
+        await run_claude(original_message, str(chat_id), bot, continue_session=True, bypass_permissions=True, thread_id=callback_thread_id)
 
 
-async def animate_status(chat_id: str, message_id: int, continue_session: bool, session_name: str, api_url: str | None = None):
+async def animate_status(chat_id: str, message_id: int, continue_session: bool, session_name: str, api_url: str | None = None, message_thread_id: int | None = None):
     """Animate the status message with rotating messages."""
     prefix = f"[<code>{session_name}</code>] " if session_name != "default" else ""
     try:
@@ -966,13 +1033,14 @@ async def run_claude(
     continue_session: bool = False,
     allowed_tools: list[str] | None = None,
     bypass_permissions: bool = False,
+    thread_id: int | None = None,
 ):
     """Run Claude and send response to Telegram."""
-    # GTD bot always bypasses permissions
-    if not bot.multi_session:
+    # Queued bot always bypasses permissions
+    if bot.use_queue:
         bypass_permissions = True
 
-    runner = get_runner_for_bot(bot)
+    runner = get_runner(bot, thread_id=thread_id or 0)
     session_name = runner.short_name
     prefix = f"[<code>{session_name}</code>] " if session_name != "default" else ""
 
@@ -982,6 +1050,7 @@ async def run_claude(
             chat_id=chat_id,
             parse_mode="HTML",
             api_url=bot.api_url,
+            message_thread_id=thread_id,
         )
         return
 
@@ -994,6 +1063,7 @@ async def run_claude(
                 chat_id=chat_id,
                 parse_mode="HTML",
                 api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
 
     # Send animated status message
@@ -1003,6 +1073,7 @@ async def run_claude(
         chat_id=chat_id,
         parse_mode="HTML",
         api_url=bot.api_url,
+        message_thread_id=thread_id,
     )
     message_id = status_msg.get("result", {}).get("message_id")
 
@@ -1010,7 +1081,7 @@ async def run_claude(
     animation_task = None
     if message_id:
         animation_task = asyncio.create_task(
-            animate_status(chat_id, message_id, continue_session, session_name, api_url=bot.api_url)
+            animate_status(chat_id, message_id, continue_session, session_name, api_url=bot.api_url, message_thread_id=thread_id)
         )
 
     try:
@@ -1032,16 +1103,38 @@ async def run_claude(
                 pass
 
         # Delete status message
-        await telegram.delete_message(chat_id, message_id, api_url=bot.api_url)
+        if message_id:
+            await telegram.delete_message(chat_id, message_id, api_url=bot.api_url)
 
         # Check for permission denials
         logger.info(f"Result: text={result.text[:100] if result.text else 'None'}, denials={result.permission_denials}")
         if result.permission_denials:
             await send_permission_request(
-                result, message, chat_id, session_name, sessions.current_dir, bot
+                result, message, chat_id, session_name, sessions.current_dir, bot, thread_id=thread_id
             )
         else:
-            await send_response(result.text, chat_id, session_name=session_name, api_url=bot.api_url)
+            response_text = result.text
+
+            # Topic rename after first Claude response
+            if thread_id and not continue_session:
+                cleaned, title = extract_title_from_response(response_text)
+                if title:
+                    response_text = cleaned
+                else:
+                    try:
+                        title = await generate_title_fallback(message, response_text)
+                    except Exception:
+                        title = None
+
+                if title:
+                    is_agent = bot.fixed_working_dir is not None
+                    new_name = format_topic_name(title, is_agent=is_agent)
+                    try:
+                        await telegram.edit_forum_topic(chat_id, thread_id, new_name, api_url=bot.api_url)
+                    except Exception as e:
+                        logger.warning(f"Failed to rename topic: {e}")
+
+            await send_response(response_text, chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=thread_id)
 
     except Exception as e:
         # Stop animation on error
@@ -1060,6 +1153,7 @@ async def run_claude(
             chat_id=chat_id,
             parse_mode="HTML",
             api_url=bot.api_url,
+            message_thread_id=thread_id,
         )
 
 
@@ -1070,6 +1164,7 @@ async def send_permission_request(
     session_name: str,
     session_dir: str,
     bot: BotConfig,
+    thread_id: int | None = None,
 ):
     """Send permission denial info to user with Allow/Deny buttons."""
     prefix = f"[<code>{session_name}</code>] " if session_name != "default" else ""
@@ -1137,6 +1232,7 @@ async def send_permission_request(
             parse_mode="HTML",
             reply_markup=buttons,
             api_url=bot.api_url,
+            message_thread_id=thread_id,
         )
     except Exception:
         # Fallback to plain text if HTML parsing fails
@@ -1147,10 +1243,11 @@ async def send_permission_request(
             parse_mode=None,
             reply_markup=buttons,
             api_url=bot.api_url,
+            message_thread_id=thread_id,
         )
 
 
-async def send_response(text: str, chat_id: str, chunk_size: int = 4000, session_name: str = "default", api_url: str | None = None):
+async def send_response(text: str, chat_id: str, chunk_size: int = 4000, session_name: str = "default", api_url: str | None = None, message_thread_id: int | None = None):
     """Send Claude's response, with quick-reply buttons if numbered options detected."""
     if not text.strip():
         await telegram.send_message(
@@ -1158,6 +1255,7 @@ async def send_response(text: str, chat_id: str, chunk_size: int = 4000, session
             chat_id=chat_id,
             parse_mode="HTML",
             api_url=api_url,
+            message_thread_id=message_thread_id,
         )
         return
 
@@ -1180,6 +1278,7 @@ async def send_response(text: str, chat_id: str, chunk_size: int = 4000, session
                 parse_mode="HTML",
                 reply_markup=reply_markup,
                 api_url=api_url,
+                message_thread_id=message_thread_id,
             )
         except Exception as e:
             # Fallback to plain text if HTML fails
@@ -1190,6 +1289,7 @@ async def send_response(text: str, chat_id: str, chunk_size: int = 4000, session
                 parse_mode=None,
                 reply_markup=reply_markup,
                 api_url=api_url,
+                message_thread_id=message_thread_id,
             )
         if not is_last:
             await asyncio.sleep(0.5)
@@ -1323,9 +1423,18 @@ async def _process_email(data: dict, bot: BotConfig):
     has_draft = data.get("hasDraft", False)
     is_from_thomas = data.get("isFromThomas", False)
     email_message_id = data.get("messageId", "")
-    thread_id = data.get("threadId", "")
+    email_thread_id = data.get("threadId", "")
 
     logger.info(f"Processing email triage: '{subject}' from {from_addr} (fromThomas={is_from_thomas}, hasDraft={has_draft})")
+
+    # Create a topic for this email triage
+    topic_name = generate_provisional_name(f"Email: {subject[:60]}", is_agent=True)
+    thread_id = None
+    try:
+        result = await telegram.create_forum_topic(bot.chat_id, topic_name, api_url=bot.api_url)
+        thread_id = result["result"]["message_thread_id"]
+    except Exception as e:
+        logger.warning(f"Failed to create topic for email triage: {e}")
 
     # Build attachment info
     attachment_info = ""
@@ -1349,7 +1458,7 @@ async def _process_email(data: dict, bot: BotConfig):
         f"**Sujet** : {subject}\n"
         f"**Date** : {date}\n"
         f"**Message ID** : {email_message_id}\n"
-        f"**Thread ID** : {thread_id}\n"
+        f"**Thread ID** : {email_thread_id}\n"
         f"**Email de Thomas** : {'OUI' if is_from_thomas else 'NON'}\n"
         f"{attachment_info}"
         f"{draft_info}\n"
@@ -1369,17 +1478,19 @@ async def _process_email(data: dict, bot: BotConfig):
             new_session=True,
             timeout=600,  # 10 min for email (MCP-heavy: Gmail + Trello + GDrive)
             metadata={"subject": subject, "from": from_addr},
+            thread_id=thread_id,
         )
         added = await gtd_queue.enqueue(item)
         if not added:
             await telegram.send_message(
                 f"⚠️ Queue pleine, email ignoré: {subject}",
                 chat_id=bot.chat_id, parse_mode="HTML", api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
     else:
         # Fallback: direct execution (shouldn't happen in production)
         try:
-            runner = get_runner_for_bot(bot)
+            runner = get_runner(bot, thread_id=thread_id or 0)
             result = await runner.run(
                 prompt,
                 new_session=True,
@@ -1388,14 +1499,15 @@ async def _process_email(data: dict, bot: BotConfig):
                 mcp_config=bot.mcp_config_path,
             )
             if result.text:
-                await send_response(result.text, bot.chat_id, session_name="gtd", api_url=bot.api_url)
+                await send_response(result.text, bot.chat_id, session_name="gtd", api_url=bot.api_url, message_thread_id=thread_id)
             else:
-                await telegram.send_message("(pas de réponse)", chat_id=bot.chat_id, api_url=bot.api_url)
+                await telegram.send_message("(pas de réponse)", chat_id=bot.chat_id, api_url=bot.api_url, message_thread_id=thread_id)
         except Exception as e:
             logger.exception("Email processing error")
             await telegram.send_message(
                 f"❌ Erreur traitement email: <code>{e}</code>\nSujet: {subject}",
                 chat_id=bot.chat_id, parse_mode="HTML", api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
 
 
@@ -1419,6 +1531,19 @@ async def cron_reminder(reminder_type: str):
 async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
     """Process a cron reminder via Claude GTD."""
     logger.info(f"Processing cron reminder: {reminder_type}")
+
+    # Silent crons don't create topics
+    silent = reminder_type in ("whatsapp", "gdrive-inbox")
+    thread_id = None
+
+    if not silent:
+        name = generate_provisional_name(f"Cron: {reminder_type}", is_agent=True)
+        try:
+            result = await telegram.create_forum_topic(bot.chat_id, name, api_url=bot.api_url)
+            thread_id = result["result"]["message_thread_id"]
+        except Exception as e:
+            logger.warning(f"Failed to create topic for cron {reminder_type}: {e}")
+
     if gtd_queue is not None:
         item = QueueItem(
             prompt=prompt,
@@ -1427,6 +1552,7 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
             new_session=True,
             timeout=600,  # 10 min for cron (MCP-heavy: Trello + Calendar)
             metadata={"reminder_type": reminder_type},
+            thread_id=thread_id,
         )
         added = await gtd_queue.enqueue(item)
         if not added:
@@ -1434,7 +1560,7 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
     else:
         # Fallback: direct execution
         try:
-            runner = get_runner_for_bot(bot)
+            runner = get_runner(bot, thread_id=thread_id or 0)
             result = await runner.run(
                 prompt,
                 new_session=True,
@@ -1443,7 +1569,7 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
                 mcp_config=bot.mcp_config_path,
             )
             if result.text:
-                await send_response(result.text, bot.chat_id, session_name="gtd", api_url=bot.api_url)
+                await send_response(result.text, bot.chat_id, session_name="gtd", api_url=bot.api_url, message_thread_id=thread_id)
         except Exception as e:
             logger.exception(f"Cron reminder error ({reminder_type})")
             await telegram.send_message(
@@ -1451,6 +1577,7 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
                 chat_id=bot.chat_id,
                 parse_mode="HTML",
                 api_url=bot.api_url,
+                message_thread_id=thread_id,
             )
 
 

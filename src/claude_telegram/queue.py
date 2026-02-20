@@ -123,7 +123,7 @@ async def process_queue_item(
 
         if message_id:
             animation_task = asyncio.create_task(
-                animate_status(item.chat_id, message_id, item.continue_session, session_name, api_url=bot.api_url)
+                animate_status(item.chat_id, message_id, item.continue_session, session_name, api_url=bot.api_url, message_thread_id=item.thread_id)
             )
 
     try:
@@ -144,7 +144,7 @@ async def process_queue_item(
             try: await animation_task
             except asyncio.CancelledError: pass
         if message_id:
-            await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url, message_thread_id=item.thread_id)
+            await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
 
         logger.info(f"Queue item completed: {item.source} (retry={item.retry_count}), response length={len(result.text)}")
 
@@ -156,16 +156,16 @@ async def process_queue_item(
                 # Short responses like "OK", "Timestamp mis à jour" = nothing to report
                 text = (result.text or "").strip()
                 if text and text.upper() != "OK" and len(text) > 200:
-                    await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url)
+                    await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id)
                 else:
                     logger.info(f"{reminder_type} scan silent (no notable action, len={len(text)})")
             elif result.text and "Claude/Urgent" in result.text:
-                await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url)
+                await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id)
             else:
                 subject = item.metadata.get("subject", "?")
                 logger.info(f"Email triage silent (no Telegram): {subject}")
         elif result.text:
-            await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url)
+            await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id)
         else:
             await telegram.send_message("<i>(pas de réponse)</i>", chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url, message_thread_id=item.thread_id)
 
@@ -200,7 +200,7 @@ async def process_queue_item(
             try: await animation_task
             except asyncio.CancelledError: pass
         if message_id:
-            await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url, message_thread_id=item.thread_id)
+            await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
 
         if item.can_retry and queue:
             retry_item = item.as_retry(str(e))
@@ -226,7 +226,7 @@ async def process_queue_item(
             try: await animation_task
             except asyncio.CancelledError: pass
         if message_id:
-            await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url, message_thread_id=item.thread_id)
+            await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
 
         logger.exception("Queue item processing error")
         if not silent:

@@ -18,7 +18,7 @@ class BotConfig:
     fixed_working_dir: str | None = None
     system_prompt_path: str | None = None
     mcp_config_path: str | None = None
-    multi_session: bool = True
+    use_queue: bool = False
     commands_whitelist: list[str] = field(default_factory=list)
 
     @property
@@ -48,7 +48,7 @@ def create_bots() -> dict[str, BotConfig]:
         name="dev",
         token=settings.telegram_bot_token,
         chat_id=settings.telegram_chat_id,
-        multi_session=True,
+        use_queue=False,
         commands_whitelist=[
             "/start", "/help", "/c", "/continue", "/new", "/dir", "/dirs",
             "/repos", "/rmdir", "/compact", "/cancel", "/status",
@@ -64,7 +64,7 @@ def create_bots() -> dict[str, BotConfig]:
             fixed_working_dir=settings.gtd_working_dir,
             system_prompt_path=settings.gtd_prompt_path,
             mcp_config_path=settings.gtd_mcp_config,
-            multi_session=False,
+            use_queue=True,
             commands_whitelist=[
                 "/start", "/help", "/new", "/compact", "/cancel", "/status",
             ],

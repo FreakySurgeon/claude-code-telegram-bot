@@ -22,7 +22,7 @@ def _make_dev_bot() -> BotConfig:
         name="dev",
         token="test_token",
         chat_id="12345",
-        multi_session=True,
+        use_queue=False,
         commands_whitelist=[
             "/start", "/help", "/c", "/continue", "/new", "/dir", "/dirs",
             "/repos", "/rmdir", "/compact", "/cancel", "/status",
@@ -52,11 +52,15 @@ def test_webhook_empty_update():
 
 @pytest.mark.asyncio
 async def test_handle_message_authorized(authorized_message):
-    """Test handling authorized message."""
+    """Test handling authorized message in a topic."""
     bot = _make_dev_bot()
+    # Add is_topic_message to skip topic creation
+    msg = authorized_message["message"]
+    msg["is_topic_message"] = True
+    msg["message_thread_id"] = 42
     with patch("claude_telegram.main.run_claude", new_callable=AsyncMock) as mock_run:
-        await handle_message(authorized_message["message"], bot)
-        mock_run.assert_called_once_with("Hello Claude", "12345", bot, continue_session=False)
+        await handle_message(msg, bot)
+        mock_run.assert_called_once_with("Hello Claude", "12345", bot, continue_session=False, thread_id=42)
 
 
 @pytest.mark.asyncio
@@ -75,6 +79,8 @@ async def test_handle_message_empty_text():
     message = {
         "chat": {"id": 12345},
         "text": "",
+        "is_topic_message": True,
+        "message_thread_id": 42,
     }
     with patch("claude_telegram.main.run_claude", new_callable=AsyncMock) as mock_run:
         await handle_message(message, bot)
@@ -98,7 +104,7 @@ async def test_handle_command_continue():
     bot = _make_dev_bot()
     with patch("claude_telegram.main.run_claude", new_callable=AsyncMock) as mock_run:
         await handle_command("/c fix the bug", "12345", bot)
-        mock_run.assert_called_once_with("fix the bug", "12345", bot, continue_session=True)
+        mock_run.assert_called_once_with("fix the bug", "12345", bot, continue_session=True, thread_id=None)
 
 
 @pytest.mark.asyncio
@@ -107,7 +113,7 @@ async def test_handle_command_continue_alias():
     bot = _make_dev_bot()
     with patch("claude_telegram.main.run_claude", new_callable=AsyncMock) as mock_run:
         await handle_command("/continue do something", "12345", bot)
-        mock_run.assert_called_once_with("do something", "12345", bot, continue_session=True)
+        mock_run.assert_called_once_with("do something", "12345", bot, continue_session=True, thread_id=None)
 
 
 @pytest.mark.asyncio
@@ -129,7 +135,7 @@ async def test_handle_command_compact():
     mock_runner.is_running = False
     mock_runner.compact = AsyncMock(return_value=ClaudeResult(text="Compacted", permission_denials=[]))
     mock_runner.short_name = "test"
-    with patch("claude_telegram.main.get_runner_for_bot", return_value=mock_runner):
+    with patch("claude_telegram.main.get_runner", return_value=mock_runner):
         with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock):
             with patch("claude_telegram.main.send_response", new_callable=AsyncMock) as mock_chunked:
                 await handle_command("/compact", "12345", bot)
@@ -143,7 +149,7 @@ async def test_handle_command_compact_while_busy():
     bot = _make_dev_bot()
     mock_runner = MagicMock()
     mock_runner.is_running = True
-    with patch("claude_telegram.main.get_runner_for_bot", return_value=mock_runner):
+    with patch("claude_telegram.main.get_runner", return_value=mock_runner):
         with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock) as mock_send:
             await handle_command("/compact", "12345", bot)
             assert "busy" in mock_send.call_args[0][0].lower()
@@ -156,7 +162,7 @@ async def test_handle_command_cancel():
     mock_runner = MagicMock()
     mock_runner.cancel = AsyncMock(return_value=True)
     mock_runner.short_name = "test"
-    with patch("claude_telegram.main.get_runner_for_bot", return_value=mock_runner):
+    with patch("claude_telegram.main.get_runner", return_value=mock_runner):
         with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock) as mock_send:
             await handle_command("/cancel", "12345", bot)
             mock_runner.cancel.assert_called_once()
@@ -169,7 +175,7 @@ async def test_handle_command_cancel_nothing():
     bot = _make_dev_bot()
     mock_runner = MagicMock()
     mock_runner.cancel = AsyncMock(return_value=False)
-    with patch("claude_telegram.main.get_runner_for_bot", return_value=mock_runner):
+    with patch("claude_telegram.main.get_runner", return_value=mock_runner):
         with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock) as mock_send:
             await handle_command("/cancel", "12345", bot)
             assert "Nothing" in mock_send.call_args[0][0]
@@ -183,7 +189,7 @@ async def test_handle_command_status():
     mock_runner.is_running = True
     mock_runner.is_in_conversation = MagicMock(return_value=True)
     mock_runner.short_name = "test"
-    with patch("claude_telegram.main.get_runner_for_bot", return_value=mock_runner):
+    with patch("claude_telegram.main.get_runner", return_value=mock_runner):
         with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock) as mock_send:
             await handle_command("/status", "12345", bot)
             assert "Running" in mock_send.call_args[0][0]
@@ -222,7 +228,7 @@ async def test_handle_command_dir_no_args():
     bot = _make_dev_bot()
     mock_runner = MagicMock()
     mock_runner.short_name = "current"
-    with patch("claude_telegram.main.get_runner_for_bot", return_value=mock_runner):
+    with patch("claude_telegram.main.get_runner", return_value=mock_runner):
         with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock) as mock_send:
             await handle_command("/dir", "12345", bot)
             assert "Current" in mock_send.call_args[0][0]
@@ -233,24 +239,17 @@ async def test_handle_command_dir_no_args():
 async def test_handle_command_dirs():
     """Test /dirs command."""
     bot = _make_dev_bot()
-    mock_session1 = MagicMock()
-    mock_session1.is_running = False
-    mock_session1.short_name = "project1"
-    mock_session2 = MagicMock()
-    mock_session2.is_running = True
-    mock_session2.short_name = "project2"
     with patch("claude_telegram.main.sessions") as mock_sessions:
-        mock_sessions.list_sessions = MagicMock(return_value=[
-            ("/path/to/project1", mock_session1),
-            ("/path/to/project2", mock_session2),
+        mock_sessions.list_dirs = MagicMock(return_value=[
+            ("/path/to/project1", 2),
+            ("/path/to/project2", 1),
         ])
-        with patch("claude_telegram.main.get_runner_for_bot", return_value=mock_session1):
-            with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock) as mock_send:
-                await handle_command("/dirs", "12345", bot)
-                message = mock_send.call_args[0][0]
-                assert "Active Sessions" in message
-                assert "project1" in message
-                assert "project2" in message
+        with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock) as mock_send:
+            await handle_command("/dirs", "12345", bot)
+            message = mock_send.call_args[0][0]
+            assert "Active Directories" in message
+            assert "project1" in message
+            assert "project2" in message
 
 
 @pytest.mark.asyncio
@@ -258,7 +257,7 @@ async def test_handle_command_dirs_empty():
     """Test /dirs command with no sessions."""
     bot = _make_dev_bot()
     with patch("claude_telegram.main.sessions") as mock_sessions:
-        mock_sessions.list_sessions = MagicMock(return_value=[])
+        mock_sessions.list_dirs = MagicMock(return_value=[])
         with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock) as mock_send:
             await handle_command("/dirs", "12345", bot)
             assert "No active sessions" in mock_send.call_args[0][0]
@@ -294,7 +293,7 @@ async def test_run_claude_when_busy():
     mock_runner = MagicMock()
     mock_runner.is_running = True
     mock_runner.short_name = "test"
-    with patch("claude_telegram.main.get_runner_for_bot", return_value=mock_runner):
+    with patch("claude_telegram.main.get_runner", return_value=mock_runner):
         with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock) as mock_send:
             await run_claude("Hello", "12345", bot, continue_session=False)
             assert "busy" in mock_send.call_args[0][0].lower()
@@ -311,14 +310,14 @@ async def test_run_claude_success():
     mock_runner.short_name = "test"
     mock_runner.context_shown = True  # Skip context check
     mock_runner.is_in_conversation = MagicMock(return_value=True)
-    with patch("claude_telegram.main.get_runner_for_bot", return_value=mock_runner):
+    with patch("claude_telegram.main.get_runner", return_value=mock_runner):
         with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock) as mock_send:
             mock_send.return_value = {"result": {"message_id": 123}}
             with patch("claude_telegram.main.telegram.delete_message", new_callable=AsyncMock):
                 with patch("claude_telegram.main.send_response", new_callable=AsyncMock) as mock_chunked:
                     await run_claude("Hello", "12345", bot, continue_session=False)
                     mock_runner.run.assert_called_once()
-                    mock_chunked.assert_called_once_with("Claude response", "12345", session_name="test", api_url=bot.api_url)
+                    mock_chunked.assert_called_once_with("Claude response", "12345", session_name="test", api_url=bot.api_url, message_thread_id=None)
 
 
 @pytest.mark.asyncio
@@ -329,7 +328,7 @@ async def test_run_claude_error():
     mock_runner.is_running = False
     mock_runner.run = AsyncMock(side_effect=Exception("Test error"))
     mock_runner.short_name = "test"
-    with patch("claude_telegram.main.get_runner_for_bot", return_value=mock_runner):
+    with patch("claude_telegram.main.get_runner", return_value=mock_runner):
         with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock) as mock_send:
             mock_send.return_value = {"result": {"message_id": 123}}
             with patch("claude_telegram.main.telegram.delete_message", new_callable=AsyncMock):

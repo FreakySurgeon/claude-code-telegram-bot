@@ -22,7 +22,7 @@ def mock_bot():
     bot.api_url = None
     bot.system_prompt = None
     bot.mcp_config_path = None
-    bot.multi_session = False
+    bot.use_queue = True
     return bot
 
 

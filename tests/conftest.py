@@ -70,7 +70,7 @@ def dev_bot():
         name="dev",
         token="test_token_123",
         chat_id="12345",
-        multi_session=True,
+        use_queue=False,
         commands_whitelist=[
             "/start", "/help", "/c", "/continue", "/new", "/dir", "/dirs",
             "/repos", "/rmdir", "/compact", "/cancel", "/status",
@@ -87,7 +87,7 @@ def gtd_bot():
         token="gtd_test_token",
         chat_id="67890",
         fixed_working_dir="/tmp/gtd",
-        multi_session=False,
+        use_queue=True,
         commands_whitelist=[
             "/start", "/help", "/new", "/compact", "/cancel", "/status",
         ],
