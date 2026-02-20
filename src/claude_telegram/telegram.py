@@ -18,6 +18,7 @@ async def send_message(
     parse_mode: str = "Markdown",
     reply_markup: dict | None = None,
     api_url: str | None = None,
+    message_thread_id: int | None = None,
 ) -> dict:
     """Send a message to Telegram."""
     api = api_url or DEFAULT_API_URL
@@ -39,6 +40,9 @@ async def send_message(
     if reply_markup:
         payload["reply_markup"] = reply_markup
 
+    if message_thread_id is not None:
+        payload["message_thread_id"] = message_thread_id
+
     async with httpx.AsyncClient() as client:
         response = await client.post(f"{api}/sendMessage", json=payload)
         if response.status_code != 200:
@@ -53,6 +57,7 @@ async def edit_message(
     chat_id: str | None = None,
     parse_mode: str = "Markdown",
     api_url: str | None = None,
+    message_thread_id: int | None = None,
 ) -> dict:
     """Edit an existing message."""
     api = api_url or DEFAULT_API_URL
@@ -65,6 +70,9 @@ async def edit_message(
     }
     if parse_mode:
         payload["parse_mode"] = parse_mode
+
+    if message_thread_id is not None:
+        payload["message_thread_id"] = message_thread_id
 
     async with httpx.AsyncClient() as client:
         response = await client.post(f"{api}/editMessageText", json=payload)
@@ -165,6 +173,60 @@ async def download_file(file_path: str, api_url: str | None = None) -> bytes:
         response = await client.get(url)
         response.raise_for_status()
         return response.content
+
+
+async def create_forum_topic(
+    chat_id: str | int,
+    name: str,
+    api_url: str | None = None,
+) -> dict:
+    """Create a forum topic in a supergroup chat."""
+    api = api_url or DEFAULT_API_URL
+    payload = {
+        "chat_id": chat_id,
+        "name": name[:128],
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{api}/createForumTopic", json=payload)
+        if response.status_code != 200:
+            logger.error(f"createForumTopic error: {response.status_code} - {response.text}")
+        response.raise_for_status()
+        return response.json()
+
+
+async def edit_forum_topic(
+    chat_id: str | int,
+    message_thread_id: int,
+    name: str,
+    api_url: str | None = None,
+) -> dict:
+    """Edit a forum topic name in a supergroup chat."""
+    api = api_url or DEFAULT_API_URL
+    payload = {
+        "chat_id": chat_id,
+        "message_thread_id": message_thread_id,
+        "name": name[:128],
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{api}/editForumTopic", json=payload)
+        if response.status_code != 200:
+            logger.error(f"editForumTopic error: {response.status_code} - {response.text}")
+        response.raise_for_status()
+        return response.json()
+
+
+async def get_chat(
+    chat_id: str | int,
+    api_url: str | None = None,
+) -> dict:
+    """Get chat information."""
+    api = api_url or DEFAULT_API_URL
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{api}/getChat", json={"chat_id": chat_id})
+        if response.status_code != 200:
+            logger.error(f"getChat error: {response.status_code} - {response.text}")
+        response.raise_for_status()
+        return response.json()
 
 
 def is_authorized(chat_id: str | int) -> bool:
