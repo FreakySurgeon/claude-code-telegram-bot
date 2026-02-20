@@ -316,3 +316,116 @@ async def test_run_default_timeout(runner, mock_process):
     with patch("asyncio.create_subprocess_exec", return_value=mock_process):
         result = await runner.run("Hello")
         assert result.text == "OK"
+
+
+# --- SessionManager hierarchical tests ---
+
+from claude_telegram.claude import SessionManager
+
+
+def test_session_manager_get_session_with_thread():
+    sm = SessionManager()
+    runner = sm.get_session("/tmp/test", thread_id=42)
+    assert runner is not None
+    assert runner.working_dir == "/tmp/test"
+
+
+def test_session_manager_same_session_twice():
+    sm = SessionManager()
+    r1 = sm.get_session("/tmp/test", thread_id=42)
+    r2 = sm.get_session("/tmp/test", thread_id=42)
+    assert r1 is r2
+
+
+def test_session_manager_different_threads():
+    sm = SessionManager()
+    r1 = sm.get_session("/tmp/test", thread_id=42)
+    r2 = sm.get_session("/tmp/test", thread_id=99)
+    assert r1 is not r2
+
+
+def test_session_manager_list_sessions_for_dir():
+    sm = SessionManager()
+    sm.get_session("/tmp/test", thread_id=42)
+    sm.get_session("/tmp/test", thread_id=99)
+    sm.get_session("/tmp/other", thread_id=1)
+    sessions = sm.list_sessions("/tmp/test")
+    assert len(sessions) == 2
+    assert 42 in sessions
+    assert 99 in sessions
+
+
+def test_session_manager_list_dirs():
+    sm = SessionManager()
+    sm.get_session("/tmp/test", thread_id=42)
+    sm.get_session("/tmp/test", thread_id=99)
+    sm.get_session("/tmp/other", thread_id=1)
+    dirs = sm.list_dirs()
+    assert len(dirs) == 2
+    assert ("/tmp/test", 2) in dirs
+    assert ("/tmp/other", 1) in dirs
+
+
+def test_session_manager_remove_session():
+    sm = SessionManager()
+    sm.get_session("/tmp/test", thread_id=42)
+    sm.get_session("/tmp/test", thread_id=99)
+    removed = sm.remove_session("/tmp/test", thread_id=42)
+    assert removed is True
+    sessions = sm.list_sessions("/tmp/test")
+    assert 42 not in sessions
+    assert 99 in sessions
+
+
+def test_session_manager_remove_cleans_empty_dir():
+    sm = SessionManager()
+    sm.get_session("/tmp/test", thread_id=42)
+    sm.remove_session("/tmp/test", thread_id=42)
+    assert "/tmp/test" not in sm.sessions
+
+
+def test_session_manager_any_running():
+    sm = SessionManager()
+    runner = sm.get_session("/tmp/test", thread_id=42)
+    assert sm.any_running() is False
+    runner.current_process = MagicMock()
+    assert sm.any_running() is True
+
+
+@pytest.mark.asyncio
+async def test_force_kill_refuses_pgid_1():
+    """Test that _force_kill refuses to killpg when pgid <= 1 (would kill all user processes)."""
+    runner = ClaudeRunner()
+    mock_proc = AsyncMock()
+    mock_proc.pid = 12345
+    mock_proc.wait = AsyncMock(return_value=0)
+    mock_proc.terminate = MagicMock()
+    runner.current_process = mock_proc
+
+    with patch('os.getpgid', return_value=1) as mock_getpgid,          patch('os.killpg') as mock_killpg:
+        await runner._force_kill()
+        # Should NOT have called killpg (pgid=1 would kill all processes)
+        mock_killpg.assert_not_called()
+        # Should have fallen back to proc.terminate()
+        mock_proc.terminate.assert_called_once()
+    assert runner.current_process is None
+
+
+@pytest.mark.asyncio
+async def test_force_kill_normal_pgid():
+    """Test that _force_kill works normally with a valid pgid > 1."""
+    import signal as sig_module
+    runner = ClaudeRunner()
+    mock_proc = AsyncMock()
+    mock_proc.pid = 12345
+    mock_proc.wait = AsyncMock(return_value=0)
+    mock_proc.terminate = MagicMock()
+    runner.current_process = mock_proc
+
+    with patch('os.getpgid', return_value=54321) as mock_getpgid,          patch('os.killpg') as mock_killpg:
+        await runner._force_kill()
+        # Should have called killpg with the valid pgid
+        mock_killpg.assert_called_once_with(54321, sig_module.SIGTERM)
+        # Should NOT have called proc.terminate()
+        mock_proc.terminate.assert_not_called()
+    assert runner.current_process is None

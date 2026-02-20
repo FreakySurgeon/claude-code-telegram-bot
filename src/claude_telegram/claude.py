@@ -357,9 +357,14 @@ class ClaudeRunner:
         proc = self.current_process
         self.current_process = None
         # Kill entire process group (Claude + MCP server children)
+        # SAFETY: pgid <= 1 would kill all user processes (kill(-1, SIGTERM))
         try:
             pgid = os.getpgid(proc.pid)
-            os.killpg(pgid, signal.SIGTERM)
+            if pgid > 1:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                logger.warning("Refusing to killpg(%s, SIGTERM) — would kill all user processes", pgid)
+                proc.terminate()
         except (ProcessLookupError, OSError):
             proc.terminate()
         try:
@@ -367,7 +372,11 @@ class ClaudeRunner:
         except asyncio.TimeoutError:
             try:
                 pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGKILL)
+                if pgid > 1:
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    logger.warning("Refusing to killpg(%s, SIGKILL) — would kill all user processes", pgid)
+                    proc.kill()
             except (ProcessLookupError, OSError):
                 proc.kill()
             try:
@@ -402,76 +411,106 @@ class ClaudeRunner:
 
 
 class SessionManager:
-    """Manages multiple Claude sessions across different directories."""
+    """Manages multiple Claude sessions across directories and topics."""
 
     def __init__(self):
-        self.sessions: dict[str, ClaudeRunner] = {}
-        # Default to configured dir, or home directory if not set
-        default_dir = settings.claude_working_dir
-        if not default_dir:
-            default_dir = str(Path.home())
-        self.current_dir: str = default_dir
+        self.sessions: dict[str, dict[int, ClaudeRunner]] = {}
+        default_dir = settings.claude_working_dir or str(Path.home())
+        self.default_dir: str = default_dir
 
-    def get_session(self, working_dir: str | None = None) -> ClaudeRunner:
-        """Get or create a session for the given directory."""
-        dir_key = working_dir or self.current_dir
-
+    def get_session(self, working_dir: str | None = None, *, thread_id: int = 0) -> ClaudeRunner:
+        """Get or create a session for the given directory + thread."""
+        dir_key = working_dir or self.default_dir
         if dir_key not in self.sessions:
-            self.sessions[dir_key] = ClaudeRunner(working_dir=dir_key)
-            logger.info(f"Created new session for: {dir_key}")
+            self.sessions[dir_key] = {}
+        if thread_id not in self.sessions[dir_key]:
+            self.sessions[dir_key][thread_id] = ClaudeRunner(working_dir=dir_key)
+            logger.info(f"Created new session for: {dir_key} thread={thread_id}")
+        return self.sessions[dir_key][thread_id]
 
-        return self.sessions[dir_key]
+    def list_sessions(self, working_dir: str | None = None) -> dict[int, ClaudeRunner] | list[tuple[str, ClaudeRunner]]:
+        """List sessions. With working_dir: return threads dict. Without: return legacy list."""
+        if working_dir is not None:
+            return dict(self.sessions.get(working_dir, {}))
+        # Legacy: return flat list of (dir, runner) for thread_id=0
+        result = []
+        for d, threads in self.sessions.items():
+            if 0 in threads:
+                result.append((d, threads[0]))
+            else:
+                # Pick first thread if no thread 0
+                first = next(iter(threads.values()))
+                result.append((d, first))
+        return result
 
-    def get_current_session(self) -> ClaudeRunner:
-        """Get the current active session."""
-        return self.get_session(self.current_dir)
+    def list_dirs(self) -> list[tuple[str, int]]:
+        """List all directories with their session count."""
+        return [(d, len(threads)) for d, threads in self.sessions.items()]
 
-    def switch_session(self, working_dir: str) -> ClaudeRunner:
-        """Switch to a different session/directory."""
-        # Treat paths without / or ~ prefix as relative to home
-        if not working_dir.startswith("/") and not working_dir.startswith("~"):
-            working_dir = f"~/{working_dir}"
-        # Expand ~ and resolve path
-        expanded = str(Path(working_dir).expanduser().resolve())
-        self.current_dir = expanded
-        return self.get_session(expanded)
-
-    def list_sessions(self) -> list[tuple[str, ClaudeRunner]]:
-        """List all active sessions."""
-        return list(self.sessions.items())
-
-    def remove_session(self, working_dir: str) -> bool:
-        """Remove a session from the manager. Returns True if removed."""
-        # Normalize path like switch_session does
-        if not working_dir.startswith("/") and not working_dir.startswith("~"):
-            working_dir = f"~/{working_dir}"
-        resolved = str(Path(working_dir).expanduser().resolve())
-
-        if resolved in self.sessions:
-            session = self.sessions[resolved]
-            # Don't remove if running
-            if session.is_running:
+    def remove_session(self, working_dir: str, *, thread_id: int | None = None) -> bool:
+        """Remove a specific session. If thread_id is None, use legacy behavior."""
+        if thread_id is not None:
+            # New hierarchical behavior
+            if working_dir not in self.sessions:
                 return False
-            del self.sessions[resolved]
-            # If we removed the current session, switch to another or default
-            if self.current_dir == resolved:
-                if self.sessions:
-                    self.current_dir = next(iter(self.sessions.keys()))
-                else:
-                    self.current_dir = str(Path.home())
+            threads = self.sessions[working_dir]
+            if thread_id not in threads:
+                return False
+            if threads[thread_id].is_running:
+                return False
+            del threads[thread_id]
+            if not threads:
+                del self.sessions[working_dir]
             return True
-        return False
+        else:
+            # Legacy behavior (used by /rmdir in main.py)
+            if not working_dir.startswith("/") and not working_dir.startswith("~"):
+                working_dir = f"~/{working_dir}"
+            resolved = str(Path(working_dir).expanduser().resolve())
+
+            if resolved in self.sessions:
+                threads = self.sessions[resolved]
+                # Don't remove if any thread is running
+                if any(r.is_running for r in threads.values()):
+                    return False
+                del self.sessions[resolved]
+                # If we removed the current dir, switch to another or default
+                if self.default_dir == resolved:
+                    if self.sessions:
+                        self.default_dir = next(iter(self.sessions.keys()))
+                    else:
+                        self.default_dir = str(Path.home())
+                return True
+            return False
 
     def any_running(self) -> bool:
-        """Check if any session is currently running."""
-        return any(s.is_running for s in self.sessions.values())
+        return any(
+            runner.is_running
+            for threads in self.sessions.values()
+            for runner in threads.values()
+        )
 
     def get_running_session(self) -> ClaudeRunner | None:
-        """Get the currently running session, if any."""
-        for session in self.sessions.values():
-            if session.is_running:
-                return session
+        for threads in self.sessions.values():
+            for runner in threads.values():
+                if runner.is_running:
+                    return runner
         return None
+
+    # Temporary backward-compat (removed in Task 5)
+    @property
+    def current_dir(self) -> str:
+        return self.default_dir
+
+    def get_current_session(self) -> ClaudeRunner:
+        return self.get_session(self.default_dir, thread_id=0)
+
+    def switch_session(self, working_dir: str) -> ClaudeRunner:
+        if not working_dir.startswith("/") and not working_dir.startswith("~"):
+            working_dir = f"~/{working_dir}"
+        expanded = str(Path(working_dir).expanduser().resolve())
+        self.default_dir = expanded
+        return self.get_session(expanded, thread_id=0)
 
 
 # Global session manager
