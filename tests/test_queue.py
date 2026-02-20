@@ -60,6 +60,25 @@ def test_queue_item_can_retry():
     assert item.can_retry is True
 
 
+def test_queue_item_with_thread_id():
+    """Test QueueItem includes thread_id."""
+    item = QueueItem(prompt="Hello", source="telegram", chat_id="123", thread_id=42)
+    assert item.thread_id == 42
+
+
+def test_queue_item_default_thread_id():
+    """Test QueueItem defaults thread_id to None."""
+    item = QueueItem(prompt="Hello", source="telegram", chat_id="123")
+    assert item.thread_id is None
+
+
+def test_queue_item_retry_preserves_thread_id():
+    """Test that retry preserves thread_id."""
+    item = QueueItem(prompt="Hello", source="telegram", chat_id="123", thread_id=42)
+    retry = item.as_retry("timeout")
+    assert retry.thread_id == 42
+
+
 @pytest.mark.asyncio
 async def test_enqueue_and_dequeue(queue):
     """Test basic enqueue/dequeue."""

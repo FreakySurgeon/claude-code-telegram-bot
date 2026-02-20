@@ -31,6 +31,7 @@ class QueueItem:
     # Retry state
     retry_count: int = 0
     original_error: str | None = None
+    thread_id: int | None = None
 
     @property
     def can_retry(self) -> bool:
@@ -50,6 +51,7 @@ class QueueItem:
             timeout=self.timeout,
             retry_count=self.retry_count + 1,
             original_error=error,
+            thread_id=self.thread_id,
         )
 
 
@@ -115,6 +117,7 @@ async def process_queue_item(
             chat_id=item.chat_id,
             parse_mode="HTML",
             api_url=bot.api_url,
+            message_thread_id=item.thread_id,
         )
         message_id = status_msg.get("result", {}).get("message_id")
 
@@ -141,7 +144,7 @@ async def process_queue_item(
             try: await animation_task
             except asyncio.CancelledError: pass
         if message_id:
-            await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
+            await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url, message_thread_id=item.thread_id)
 
         logger.info(f"Queue item completed: {item.source} (retry={item.retry_count}), response length={len(result.text)}")
 
@@ -164,7 +167,7 @@ async def process_queue_item(
         elif result.text:
             await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url)
         else:
-            await telegram.send_message("<i>(pas de réponse)</i>", chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url)
+            await telegram.send_message("<i>(pas de réponse)</i>", chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url, message_thread_id=item.thread_id)
 
         # --- Post-session memory enrichment (loaded from external file) ---
         if item.source == "telegram" and result.text and len(result.text) > 100:
@@ -197,7 +200,7 @@ async def process_queue_item(
             try: await animation_task
             except asyncio.CancelledError: pass
         if message_id:
-            await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
+            await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url, message_thread_id=item.thread_id)
 
         if item.can_retry and queue:
             retry_item = item.as_retry(str(e))
@@ -207,12 +210,14 @@ async def process_queue_item(
                 await telegram.send_message(
                     f"⏰ Timeout après {timeout_min}min — retry automatique en cours...",
                     chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url,
+                    message_thread_id=item.thread_id,
                 )
         else:
             if not silent:
                 await telegram.send_message(
                     "❌ Échec après 2 tentatives (timeout). Requête abandonnée.",
                     chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url,
+                    message_thread_id=item.thread_id,
                 )
 
     except Exception as e:
@@ -221,11 +226,12 @@ async def process_queue_item(
             try: await animation_task
             except asyncio.CancelledError: pass
         if message_id:
-            await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
+            await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url, message_thread_id=item.thread_id)
 
         logger.exception("Queue item processing error")
         if not silent:
             await telegram.send_message(
                 f"❌ <b>Erreur:</b> <code>{e}</code>",
                 chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url,
+                message_thread_id=item.thread_id,
             )
