@@ -167,15 +167,17 @@ def get_session_summary(session_file: Path, max_chars: int = 1000) -> str | None
 def notify(event_type: str, working_dir: str | None = None):
     """Send notification to the server with optional summary."""
     summary = None
+    session_id = None
     if working_dir:
         session_file = get_latest_session_file(working_dir)
         if session_file:
             summary = get_session_summary(session_file)
+            session_id = session_file.stem
 
     try:
         response = httpx.post(
             f"{SERVER_URL}/notify/{event_type}",
-            json={"summary": summary, "working_dir": working_dir},
+            json={"summary": summary, "working_dir": working_dir, "session_id": session_id},
             timeout=10.0,
         )
         response.raise_for_status()

@@ -81,6 +81,11 @@ from .markdown import markdown_to_telegram_html
 from .tunnel import tunnel, CloudflareTunnel
 from .queue import QueueItem, RequestQueue, process_queue_item
 from .topic import generate_provisional_name, extract_title_from_response, generate_title_fallback, format_topic_name, working_dir_name
+from .pending_actions import (
+    add_action,
+    cleanup_actions,
+    is_duplicate,
+)
 
 # Store pending permission requests for retry
 pending_permissions: dict[str, dict] = {}  # chat_id -> {message, denials, session_key, bot_name}
@@ -471,8 +476,13 @@ async def _resume_session(
     bot: BotConfig,
     thread_id: int | None,
     is_topic_message: bool,
+    source_message_id: int | None = None,
 ):
-    """Resume a specific Claude session — create topic, show recap, run Claude."""
+    """Resume a specific Claude session — create topic, show recap, run Claude.
+
+    If source_message_id is provided, edits that message to replace the button
+    with a clickable link to the new topic (edit-in-place UX).
+    """
     # Create topic if not already in one
     if not is_topic_message:
         # Use first user message as topic name
@@ -485,21 +495,38 @@ async def _resume_session(
         except Exception as e:
             logger.error(f"Failed to create topic for resume: {e}")
             await telegram.send_message(
-                f"❌ Impossible de créer le topic : {html.escape(str(e))}",
+                f"❌ Failed to create topic: {html.escape(str(e))}",
                 chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
             )
             return
 
-        # Send clickable link in General so user can navigate to the new topic
-        # For private supergroups: t.me/c/<chat_id_without_-100>/<thread_id>
+        # Build topic deep link
         numeric_chat_id = str(chat_id).lstrip("-")
         if numeric_chat_id.startswith("100"):
             numeric_chat_id = numeric_chat_id[3:]
         topic_url = f"https://t.me/c/{numeric_chat_id}/{thread_id}"
-        await telegram.send_message(
-            f"📂 <a href=\"{topic_url}\">{html.escape(name)}</a>",
-            chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
-        )
+
+        if source_message_id:
+            # Edit the source message (e.g. notification) to replace button with topic link
+            try:
+                link_text = f"📂 <a href=\"{topic_url}\">{html.escape(name)}</a>"
+                await telegram.edit_message(
+                    source_message_id, link_text,
+                    chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to edit source message: {e}")
+                # Fall back to sending a new message
+                await telegram.send_message(
+                    f"📂 <a href=\"{topic_url}\">{html.escape(name)}</a>",
+                    chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                )
+        else:
+            # Send clickable link in General so user can navigate to the new topic
+            await telegram.send_message(
+                f"📂 <a href=\"{topic_url}\">{html.escape(name)}</a>",
+                chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+            )
 
     # Show message recap in the topic
     recap_lines = []
@@ -515,7 +542,7 @@ async def _resume_session(
     if recap_lines:
         recap = "\n".join(recap_lines)
         await telegram.send_message(
-            f"📜 <b>Session reprise</b> (<code>{session_id[:8]}…</code>)\n\n{recap}",
+            f"📜 <b>Session resumed</b> (<code>{session_id[:8]}…</code>)\n\n{recap}",
             chat_id=chat_id, parse_mode="HTML",
             api_url=bot.api_url, message_thread_id=thread_id,
         )
@@ -1119,11 +1146,12 @@ async def handle_callback(callback: dict, bot: BotConfig):
 
     elif data.startswith("resume:"):
         session_id = data.split(":", 1)[1]
+        msg_id = callback["message"]["message_id"]
         working_dir = bot.fixed_working_dir or sessions.default_dir
-        messages = read_session_messages(session_id, working_dir)
+        messages = read_session_messages(session_id, working_dir, last_n=10)
         if messages is None:
             await telegram.send_message(
-                f"❌ Session introuvable : <code>{html.escape(session_id[:40])}</code>",
+                f"❌ Session not found: <code>{html.escape(session_id[:40])}</code>",
                 chat_id=str(chat_id), parse_mode="HTML", api_url=bot.api_url,
             )
             return
@@ -1131,6 +1159,7 @@ async def handle_callback(callback: dict, bot: BotConfig):
         await _resume_session(
             session_id, "Continue.", messages, working_dir,
             str(chat_id), bot, thread_id=None, is_topic_message=False,
+            source_message_id=msg_id,
         )
 
     elif data == "perm:allow":
@@ -1571,10 +1600,12 @@ async def notify(event_type: str, request: Request):
     """Called by Claude hooks to send notifications."""
     summary = None
     working_dir = None
+    session_id = None
     try:
         data = await request.json()
         summary = data.get("summary")
         working_dir = data.get("working_dir")
+        session_id = data.get("session_id")
     except Exception:
         pass
 
@@ -1588,25 +1619,41 @@ async def notify(event_type: str, request: Request):
     if not target_bot:
         return {"ok": False, "error": "No bot configured"}
 
+    reply_markup = None
+
     if event_type == "completed":
         msg = "✅ <b>Claude has completed the task.</b>"
         if working_dir:
             dir_name = working_dir.split("/")[-1]
-            msg = f"✅ <b>Claude has completed</b> (<code>{dir_name}</code>)"
+            msg = f"✅ <b>Claude has completed</b> (<code>{html.escape(dir_name)}</code>)"
         if summary:
-            summary_text = summary[:1500] if len(summary) > 1500 else summary
+            # Truncate to ~5 lines for preview
+            lines = summary.split("\n")
+            preview = "\n".join(lines[:5])
+            if len(lines) > 5:
+                preview += "\n…"
+            # Cap at 800 chars
+            if len(preview) > 800:
+                preview = preview[:800] + "…"
             try:
-                summary_html = markdown_to_telegram_html(summary_text)
+                preview_html = markdown_to_telegram_html(preview)
             except Exception:
-                import html
-                summary_html = html.escape(summary_text)
-            msg += f"\n\n{summary_html}"
+                preview_html = html.escape(preview)
+            msg += f"\n\n{preview_html}"
+        # Add "Continue" button if session_id is available
+        if session_id:
+            reply_markup = {"inline_keyboard": [[
+                {"text": "Continue ➜", "callback_data": f"resume:{session_id}"},
+            ]]}
     elif event_type == "waiting":
         msg = "⏸ Claude is waiting for input."
     else:
         msg = f"📢 Claude event: {event_type}"
 
-    await telegram.send_message(msg, chat_id=target_bot.chat_id, parse_mode="HTML", api_url=target_bot.api_url)
+    await telegram.send_message(
+        msg, chat_id=target_bot.chat_id, parse_mode="HTML",
+        api_url=target_bot.api_url, reply_markup=reply_markup,
+    )
     return {"ok": True}
 
 
@@ -1801,6 +1848,168 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
                 api_url=bot.api_url,
                 message_thread_id=thread_id,
             )
+
+
+@app.post("/cron/calendar-actions")
+async def cron_calendar_actions():
+    """Scan tomorrow's calendar for <agent> prompts and execute them."""
+    gtd_bot = bots.get("gtd")
+    if not gtd_bot:
+        return {"error": "GTD bot not configured"}
+
+    asyncio.create_task(_process_calendar_actions(gtd_bot))
+    return {"status": "accepted", "type": "calendar-actions"}
+
+
+async def _process_calendar_actions(bot: BotConfig):
+    """Two-phase calendar action processing."""
+    import json as json_mod
+    from pathlib import Path
+    from datetime import datetime
+
+    working_dir = bot.fixed_working_dir or sessions.default_dir
+    pending_path = Path(working_dir) / "data" / "pending-actions.json"
+    scan_path = Path(working_dir) / "data" / "calendar-scan.json"
+
+    # Cleanup old actions first
+    cleanup_actions(pending_path)
+
+    # --- Phase 1: Scanner session ---
+    logger.info("Calendar actions: Phase 1 — scanning tomorrow's events")
+
+    scan_prompt = _load_cron_prompt("calendar-scan")
+    if not scan_prompt:
+        logger.error("Calendar actions: calendar-scan.txt not found")
+        return
+
+    # Run scanner synchronously (wait for completion)
+    runner = get_runner(bot, thread_id=0)
+    try:
+        result = await runner.run(
+            scan_prompt,
+            new_session=True,
+            bypass_permissions=True,
+            system_prompt=bot.system_prompt,
+            mcp_config=bot.mcp_config_path,
+            timeout=120,
+        )
+        logger.info(f"Calendar actions: scan complete (session {runner.session_id})")
+    except Exception as e:
+        logger.error(f"Calendar actions: scan failed: {e}")
+        return
+
+    # --- Phase 2: Parse results and enqueue actions ---
+    logger.info("Calendar actions: Phase 2 — orchestrating action topics")
+
+    try:
+        scan_data = json_mod.loads(scan_path.read_text())
+    except (FileNotFoundError, json_mod.JSONDecodeError) as e:
+        logger.error(f"Calendar actions: failed to read scan results: {e}")
+        return
+
+    events = scan_data.get("events", [])
+    if not events:
+        logger.info("Calendar actions: no events with <agent> tags found")
+        return
+
+    # Load action template
+    action_template = _load_cron_prompt("calendar-action")
+    if not action_template:
+        logger.error("Calendar actions: calendar-action.txt template not found")
+        return
+
+    enqueued = 0
+    for event in events:
+        for i, agent in enumerate(event.get("agent_prompts", [])):
+            event_id = event.get("event_id", "unknown")
+            action_id = f"evt_{event_id}_{i}"
+            prompt_text = agent.get("prompt", "")
+            confirm = agent.get("confirm", True)
+
+            # Deduplication
+            if is_duplicate(pending_path, event_id, prompt_text):
+                logger.info(f"Calendar actions: skipping duplicate {action_id}")
+                continue
+
+            # Build confirm instructions
+            if confirm:
+                confirm_instructions = (
+                    "Exécute l'instruction ci-dessus. Présente le résultat, puis demande "
+                    "confirmation à Thomas :\n"
+                    '"✅ Confirmer / ✏️ Modifier / ❌ Annuler"\n\n'
+                    "Quand Thomas confirme ou modifie, exécute l'action finale puis mets "
+                    "à jour data/pending-actions.json : change le status de l'action "
+                    f'(id: "{action_id}") à "confirmed" ou "cancelled".'
+                )
+            else:
+                confirm_instructions = (
+                    "Exécute l'instruction ci-dessus directement, sans attendre de "
+                    "confirmation. Mets à jour data/pending-actions.json : change le status "
+                    f'de l\'action (id: "{action_id}") à "confirmed".'
+                )
+
+            # Build prompt from template
+            prompt = action_template.format(
+                event_title=event.get("title", ""),
+                event_date=event.get("date", ""),
+                start_time=event.get("start_time", ""),
+                end_time=event.get("end_time", ""),
+                event_description=event.get("description", ""),
+                agent_prompt=prompt_text,
+                confirm_instructions=confirm_instructions,
+            )
+
+            # Create Telegram topic
+            topic_name = generate_provisional_name(
+                f"📅 {event.get('title', 'Action calendrier')}", is_agent=True
+            )
+            thread_id = None
+            try:
+                topic_result = await telegram.create_forum_topic(
+                    bot.chat_id, topic_name, api_url=bot.api_url
+                )
+                thread_id = topic_result["result"]["message_thread_id"]
+            except Exception as e:
+                logger.warning(f"Calendar actions: failed to create topic for {action_id}: {e}")
+
+            # Save to pending-actions.json
+            action_entry = {
+                "id": action_id,
+                "event_id": event_id,
+                "event_title": event.get("title", ""),
+                "event_date": event.get("date", ""),
+                "prompt": prompt_text,
+                "confirm": confirm,
+                "status": "pending",
+                "thread_id": thread_id,
+                "created_at": datetime.now().isoformat(),
+                "executed_at": None,
+                "resolved_at": None,
+            }
+            add_action(pending_path, action_entry)
+
+            # Enqueue for Claude execution
+            if gtd_queue is not None:
+                item = QueueItem(
+                    prompt=prompt,
+                    source="cron",
+                    chat_id=bot.chat_id,
+                    new_session=True,
+                    timeout=600,
+                    metadata={
+                        "reminder_type": "calendar-action",
+                        "action_id": action_id,
+                    },
+                    thread_id=thread_id,
+                )
+                added = await gtd_queue.enqueue(item)
+                if added:
+                    enqueued += 1
+                    logger.info(f"Calendar actions: enqueued {action_id} → topic {thread_id}")
+            else:
+                logger.warning("Calendar actions: queue unavailable, skipping execution")
+
+    logger.info(f"Calendar actions: {enqueued} actions enqueued from {len(events)} events")
 
 
 @app.post("/test")
