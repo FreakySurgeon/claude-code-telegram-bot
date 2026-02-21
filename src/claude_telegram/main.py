@@ -79,7 +79,7 @@ from .claude import sessions, ClaudeResult, PermissionDenial, get_session_permis
 from .config import settings
 from .markdown import markdown_to_telegram_html
 from .tunnel import tunnel, CloudflareTunnel
-from .queue import QueueItem, RequestQueue, process_queue_item
+from .queue import QueueItem, RequestQueue, process_queue_item, PersistentQueue, ApiStatus
 from .topic import generate_provisional_name, extract_title_from_response, generate_title_fallback, format_topic_name, working_dir_name
 from .pending_actions import (
     add_action,
@@ -105,6 +105,8 @@ polling_tasks: list[asyncio.Task] = []
 # Queue for GTD bot (initialized in lifespan)
 gtd_queue: RequestQueue | None = None
 queue_worker_task: asyncio.Task | None = None
+persistent_queue: PersistentQueue | None = None
+api_status: ApiStatus | None = None
 
 def get_runner(bot: BotConfig, thread_id: int = 0):
     """Get the runner for a bot + thread combination."""
@@ -168,7 +170,7 @@ async def poll_updates(bot: BotConfig):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Setup and teardown."""
-    global bots, chat_to_bot, polling_tasks, tunnel_url, gtd_queue, queue_worker_task
+    global bots, chat_to_bot, polling_tasks, tunnel_url, gtd_queue, queue_worker_task, persistent_queue, api_status
 
     # Initialize bots
     bots = create_bots()
@@ -222,6 +224,14 @@ async def lifespan(app: FastAPI):
         gtd_queue = RequestQueue(maxsize=30)
         queue_worker_task = asyncio.create_task(queue_worker(gtd_queue, gtd_bot_instance))
 
+        # Initialize persistent queue for API unavailability
+        import os
+        working_dir = gtd_bot_instance.fixed_working_dir or os.getcwd()
+        persistent_queue = PersistentQueue(Path(working_dir) / "data" / "queue")
+        api_status = ApiStatus()
+        if not persistent_queue.is_empty:
+            logger.info(f"Found {persistent_queue.size} items in persistent queue from previous run")
+
     yield
 
     # Cleanup
@@ -248,6 +258,30 @@ async def lifespan(app: FastAPI):
 
 
 
+async def _replay_persistent_queue(bot: BotConfig, queue: RequestQueue):
+    """Replay all items from the persistent queue after API recovery."""
+    items_files = list(zip(persistent_queue.list_items(), persistent_queue.list_files()))
+    if not items_files:
+        return
+
+    count = len(items_files)
+    logger.info(f"Replaying {count} items from persistent queue")
+    await telegram.send_message(
+        f"✅ Claude est de retour ! Traitement de {count} message(s) en attente...",
+        chat_id=bot.chat_id,
+        parse_mode="HTML",
+        api_url=bot.api_url,
+    )
+
+    for item, filepath in items_files:
+        added = await queue.enqueue(item)
+        if added:
+            persistent_queue.delete(filepath)
+        else:
+            logger.warning("Queue full during replay, stopping")
+            break
+
+
 async def queue_worker(queue: RequestQueue, bot: BotConfig):
     """Worker loop: dequeue and process items one at a time."""
     logger.info("Queue worker started")
@@ -256,7 +290,12 @@ async def queue_worker(queue: RequestQueue, bot: BotConfig):
             item = await queue.dequeue()
             logger.info(f"Processing queued {item.source} request (retry={item.retry_count})")
             runner = get_runner(bot, thread_id=item.thread_id or 0)
-            await process_queue_item(item, runner, bot, queue=queue)
+            await process_queue_item(item, runner, bot, queue=queue,
+                                     persistent_queue=persistent_queue,
+                                     api_status=api_status)
+            # After successful processing, replay persistent queue if API recovered
+            if persistent_queue and not persistent_queue.is_empty and api_status and not api_status.unavailable:
+                await _replay_persistent_queue(bot, queue)
         except asyncio.CancelledError:
             logger.info("Queue worker stopped")
             break
@@ -277,6 +316,8 @@ async def health():
         "active_sessions": sum(len(threads) for threads in sessions.sessions.values()),
         "active_dirs": len(sessions.sessions),
         "queue_size": gtd_queue.size if gtd_queue else 0,
+        "persistent_queue_size": persistent_queue.size if persistent_queue else 0,
+        "api_unavailable": api_status.unavailable if api_status else False,
     }
 
 
@@ -350,6 +391,15 @@ async def handle_message(message: dict, bot: BotConfig):
             new_session=topic_just_created,
             thread_id=thread_id,
         )
+        # Fast-path: persist directly if API unavailable
+        if api_status and api_status.unavailable and persistent_queue:
+            persistent_queue.save(item)
+            await telegram.send_message(
+                f"📥 Message en file d'attente (position {persistent_queue.size}). Claude indisponible.",
+                chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                message_thread_id=thread_id,
+            )
+            return
         added = await gtd_queue.enqueue(item)
         if not added:
             await telegram.send_message(
@@ -605,6 +655,15 @@ async def handle_voice(message: dict, bot: BotConfig, *, thread_id: int | None =
                     new_session=topic_just_created,
                     thread_id=thread_id,
                 )
+                # Fast-path: persist directly if API unavailable
+                if api_status and api_status.unavailable and persistent_queue:
+                    persistent_queue.save(item)
+                    await telegram.send_message(
+                        f"📥 Message vocal en file d'attente (position {persistent_queue.size}). Claude indisponible.",
+                        chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                        message_thread_id=thread_id,
+                    )
+                    return
                 added = await gtd_queue.enqueue(item)
                 if not added:
                     await telegram.send_message(
@@ -702,6 +761,15 @@ async def handle_photo(message: dict, bot: BotConfig, *, thread_id: int | None =
                 new_session=topic_just_created,
                 thread_id=thread_id,
             )
+            # Fast-path: persist directly if API unavailable
+            if api_status and api_status.unavailable and persistent_queue:
+                persistent_queue.save(item)
+                await telegram.send_message(
+                    f"📥 Image en file d'attente (position {persistent_queue.size}). Claude indisponible.",
+                    chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                    message_thread_id=thread_id,
+                )
+                return
             added = await gtd_queue.enqueue(item)
             if not added:
                 await telegram.send_message(
@@ -1609,6 +1677,8 @@ async def notify(event_type: str, request: Request):
     except Exception:
         pass
 
+    logger.info(f"notify/{event_type}: working_dir={working_dir}, session_id={session_id}, has_summary={summary is not None}")
+
     # Determine which bot to notify based on working_dir
     target_bot = bots.get("dev")
     if working_dir and bots.get("gtd"):
@@ -1749,6 +1819,11 @@ async def _process_email(data: dict, bot: BotConfig):
             metadata={"subject": subject, "from": from_addr},
             thread_id=thread_id,
         )
+        # Fast-path: persist directly if API unavailable
+        if api_status and api_status.unavailable and persistent_queue:
+            persistent_queue.save(item)
+            logger.info(f"API unavailable, persisted email to disk (queue size: {persistent_queue.size})")
+            return
         added = await gtd_queue.enqueue(item)
         if not added:
             await telegram.send_message(
@@ -1932,6 +2007,11 @@ async def _process_calendar_actions(bot: BotConfig):
                     },
                     thread_id=thread_id,
                 )
+                # Fast-path: persist directly if API unavailable
+                if api_status and api_status.unavailable and persistent_queue:
+                    persistent_queue.save(item)
+                    logger.info(f"API unavailable, persisted calendar action to disk")
+                    continue
                 added = await gtd_queue.enqueue(item)
                 if added:
                     enqueued += 1
@@ -1985,6 +2065,11 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
             metadata={"reminder_type": reminder_type},
             thread_id=thread_id,
         )
+        # Fast-path: persist directly if API unavailable
+        if api_status and api_status.unavailable and persistent_queue:
+            persistent_queue.save(item)
+            logger.info(f"API unavailable, persisted cron {reminder_type} to disk (queue size: {persistent_queue.size})")
+            return
         added = await gtd_queue.enqueue(item)
         if not added:
             logger.warning(f"Queue full, skipping cron {reminder_type}")
