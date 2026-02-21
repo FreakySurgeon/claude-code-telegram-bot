@@ -75,12 +75,12 @@ def get_continue_message() -> str:
     return f"🔄 <i>{verb}...</i>"
 
 from . import telegram
-from .claude import sessions, ClaudeResult, PermissionDenial, get_session_permission_mode
+from .claude import sessions, ClaudeResult, PermissionDenial, get_session_permission_mode, list_recent_sessions, read_session_messages
 from .config import settings
 from .markdown import markdown_to_telegram_html
 from .tunnel import tunnel, CloudflareTunnel
 from .queue import QueueItem, RequestQueue, process_queue_item
-from .topic import generate_provisional_name, extract_title_from_response, generate_title_fallback, format_topic_name
+from .topic import generate_provisional_name, extract_title_from_response, generate_title_fallback, format_topic_name, working_dir_name
 
 # Store pending permission requests for retry
 pending_permissions: dict[str, dict] = {}  # chat_id -> {message, denials, session_key, bot_name}
@@ -327,8 +327,10 @@ async def handle_message(message: dict, bot: BotConfig):
 
     # --- Topic routing ---
     # If message is in General (not a topic message), create a new topic
+    topic_just_created = False
     if not is_topic_message:
         thread_id = await _create_topic_for_message(text, chat_id, bot)
+        topic_just_created = True
 
     # Route to handler
     runner = get_runner(bot, thread_id=thread_id or 0)
@@ -340,6 +342,7 @@ async def handle_message(message: dict, bot: BotConfig):
             source="telegram",
             chat_id=chat_id,
             continue_session=continue_session,
+            new_session=topic_just_created,
             thread_id=thread_id,
         )
         added = await gtd_queue.enqueue(item)
@@ -357,13 +360,15 @@ async def handle_message(message: dict, bot: BotConfig):
             )
         return
 
-    await run_claude(text, chat_id, bot, continue_session=continue_session, thread_id=thread_id)
+    await run_claude(text, chat_id, bot, continue_session=continue_session, thread_id=thread_id, new_session=topic_just_created)
 
 
 async def _create_topic_for_message(text: str, chat_id: str, bot: BotConfig) -> int:
     """Create a new topic for a message sent in General."""
-    is_agent = bot.fixed_working_dir is not None
-    name = generate_provisional_name(text, is_agent=is_agent)
+    if bot.fixed_working_dir:
+        name = generate_provisional_name(text, is_agent=True)
+    else:
+        name = generate_provisional_name(text, dir_name=working_dir_name(sessions.default_dir))
     try:
         result = await telegram.create_forum_topic(chat_id, name, api_url=bot.api_url)
         thread_id = result["result"]["message_thread_id"]
@@ -374,6 +379,153 @@ async def _create_topic_for_message(text: str, chat_id: str, bot: BotConfig) -> 
         raise
 
 
+async def _send_dir_browser(
+    rel_path: str, chat_id: str, bot: BotConfig, thread_id: int | None,
+    edit_message_id: int | None = None,
+):
+    """Send (or edit) a directory browser with clickable buttons for subdirectories.
+
+    If edit_message_id is provided, edits that message in-place instead of sending a new one.
+    """
+    home = Path.home()
+    browse_dir = home / rel_path if rel_path else home
+
+    if not browse_dir.is_dir():
+        text = f"❌ Not found: <code>{html.escape(rel_path)}</code>"
+        if edit_message_id:
+            await telegram.edit_message(edit_message_id, text, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url)
+        else:
+            await telegram.send_message(text, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url, message_thread_id=thread_id)
+        return
+
+    # List subdirectories (skip hidden dirs and common noise)
+    skip = {".", "..", "__pycache__", "node_modules", ".git", ".venv", "venv", ".cache", ".local", ".config", ".npm", ".nvm"}
+    try:
+        subdirs = sorted(
+            d.name for d in browse_dir.iterdir()
+            if d.is_dir() and d.name not in skip and not d.name.startswith(".")
+        )
+    except PermissionError:
+        subdirs = []
+
+    current_name = Path(sessions.default_dir).name
+    display_path = f"~/{rel_path}" if rel_path else "~"
+
+    buttons = []
+    # Navigation: back button if not at root
+    if rel_path:
+        parent = str(Path(rel_path).parent)
+        if parent == ".":
+            parent = ""
+        buttons.append([{"text": "⬆️ ..", "callback_data": f"browse:{parent}"}])
+        # Select this directory button
+        buttons.append([{"text": f"✅ Select {browse_dir.name}", "callback_data": f"dir:{rel_path}"}])
+    else:
+        # At root: offer to stay in current dir
+        buttons.append([{"text": f"✅ Stay in {current_name}", "callback_data": "dir:_stay"}])
+
+    # Subdirectory buttons (2 per row, max 20)
+    row = []
+    for name in subdirs[:20]:
+        child_path = f"{rel_path}/{name}" if rel_path else name
+        # callback_data max 64 bytes — truncate if needed
+        cb = f"browse:{child_path}"
+        if len(cb.encode()) > 64:
+            continue
+        row.append({"text": f"📁 {name}", "callback_data": cb})
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    text = (
+        f"📂 <code>{html.escape(display_path)}</code>\n"
+        f"📍 Current: <code>{html.escape(current_name)}</code>"
+    )
+    markup = {"inline_keyboard": buttons}
+
+    if not subdirs and not rel_path:
+        text = f"📂 <code>{html.escape(display_path)}</code> — no subdirectories"
+        markup = None
+
+    if edit_message_id:
+        await telegram.edit_message(
+            edit_message_id, text, chat_id=chat_id, parse_mode="HTML",
+            api_url=bot.api_url, reply_markup=markup,
+        )
+    else:
+        await telegram.send_message(
+            text, chat_id=chat_id, parse_mode="HTML",
+            reply_markup=markup, api_url=bot.api_url,
+            message_thread_id=thread_id,
+        )
+
+
+async def _resume_session(
+    session_id: str,
+    message: str,
+    messages: list[dict],
+    working_dir: str,
+    chat_id: str,
+    bot: BotConfig,
+    thread_id: int | None,
+    is_topic_message: bool,
+):
+    """Resume a specific Claude session — create topic, show recap, run Claude."""
+    # Create topic if not already in one
+    if not is_topic_message:
+        # Use first user message as topic name
+        first_msg = next((m["text"] for m in messages if m["role"] == "user"), message)
+        dir_name = working_dir_name(working_dir) if not bot.fixed_working_dir else None
+        name = generate_provisional_name(first_msg, dir_name=dir_name, is_agent=bool(bot.fixed_working_dir))
+        try:
+            result = await telegram.create_forum_topic(chat_id, name, api_url=bot.api_url)
+            thread_id = result["result"]["message_thread_id"]
+        except Exception as e:
+            logger.error(f"Failed to create topic for resume: {e}")
+            await telegram.send_message(
+                f"❌ Impossible de créer le topic : {html.escape(str(e))}",
+                chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+            )
+            return
+
+        # Send clickable link in General so user can navigate to the new topic
+        # For private supergroups: t.me/c/<chat_id_without_-100>/<thread_id>
+        numeric_chat_id = str(chat_id).lstrip("-")
+        if numeric_chat_id.startswith("100"):
+            numeric_chat_id = numeric_chat_id[3:]
+        topic_url = f"https://t.me/c/{numeric_chat_id}/{thread_id}"
+        await telegram.send_message(
+            f"📂 <a href=\"{topic_url}\">{html.escape(name)}</a>",
+            chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+        )
+
+    # Show message recap in the topic
+    recap_lines = []
+    for m in messages:
+        text = m["text"][:200].replace("\n", " ")
+        if len(m["text"]) > 200:
+            text += "…"
+        if m["role"] == "user":
+            recap_lines.append(f"👤 <b>{html.escape(text)}</b>")
+        else:
+            recap_lines.append(f"🤖 <i>{html.escape(text)}</i>")
+
+    if recap_lines:
+        recap = "\n".join(recap_lines)
+        await telegram.send_message(
+            f"📜 <b>Session reprise</b> (<code>{session_id[:8]}…</code>)\n\n{recap}",
+            chat_id=chat_id, parse_mode="HTML",
+            api_url=bot.api_url, message_thread_id=thread_id,
+        )
+
+    # Set session_id on the runner and run
+    runner = get_runner(bot, thread_id=thread_id or 0)
+    runner.session_id = session_id
+    await run_claude(message, chat_id, bot, continue_session=False, thread_id=thread_id)
+
+
 async def handle_voice(message: dict, bot: BotConfig, *, thread_id: int | None = None):
     """Handle voice/audio messages — transcribe and offer to process."""
     chat_id = str(message["chat"]["id"])
@@ -382,8 +534,10 @@ async def handle_voice(message: dict, bot: BotConfig, *, thread_id: int | None =
     file_id = voice["file_id"]
 
     # Topic routing: create topic if message is in General
+    topic_just_created = False
     if not is_topic_message:
         thread_id = await _create_topic_for_message("Message vocal", chat_id, bot)
+        topic_just_created = True
 
     await telegram.send_message(
         "🎤 <i>Transcription en cours...</i>",
@@ -421,6 +575,7 @@ async def handle_voice(message: dict, bot: BotConfig, *, thread_id: int | None =
                     source="telegram",
                     chat_id=chat_id,
                     continue_session=False,
+                    new_session=topic_just_created,
                     thread_id=thread_id,
                 )
                 added = await gtd_queue.enqueue(item)
@@ -437,7 +592,7 @@ async def handle_voice(message: dict, bot: BotConfig, *, thread_id: int | None =
                         message_thread_id=thread_id,
                     )
             else:
-                await run_claude(transcription_prompt, chat_id, bot, continue_session=False, thread_id=thread_id)
+                await run_claude(transcription_prompt, chat_id, bot, continue_session=False, thread_id=thread_id, new_session=topic_just_created)
         else:
             # For Dev bot: show transcription with button to process
             # Store full text in memory (callback_data limited to 64 bytes)
@@ -478,8 +633,10 @@ async def handle_photo(message: dict, bot: BotConfig, *, thread_id: int | None =
     caption = message.get("caption", "")
 
     # Topic routing: create topic if message is in General
+    topic_just_created = False
     if not is_topic_message:
         thread_id = await _create_topic_for_message(caption or "Image", chat_id, bot)
+        topic_just_created = True
 
     # Get file_id: photo array (take largest) or document
     photo = message.get("photo")
@@ -515,6 +672,7 @@ async def handle_photo(message: dict, bot: BotConfig, *, thread_id: int | None =
                 source="telegram",
                 chat_id=chat_id,
                 continue_session=continue_session,
+                new_session=topic_just_created,
                 thread_id=thread_id,
             )
             added = await gtd_queue.enqueue(item)
@@ -539,7 +697,7 @@ async def handle_photo(message: dict, bot: BotConfig, *, thread_id: int | None =
             try:
                 runner = get_runner(bot, thread_id=thread_id or 0)
                 continue_session = runner.is_in_conversation()
-                await run_claude(image_prompt, chat_id, bot, continue_session=continue_session, thread_id=thread_id)
+                await run_claude(image_prompt, chat_id, bot, continue_session=continue_session, thread_id=thread_id, new_session=topic_just_created)
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
 
@@ -589,6 +747,7 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig, *, thread_id: 
                 "<b>Commands</b>\n"
                 "<code>/c &lt;msg&gt;</code> — Continue conversation\n"
                 "<code>/new &lt;msg&gt;</code> — Fresh session\n"
+                "<code>/resume</code> — Resume a previous session\n"
                 "<code>/dir path</code> — Switch directory (relative to ~)\n"
                 "<code>/dirs</code> — List sessions + buttons\n"
                 "<code>/repos</code> — Favorite repos\n"
@@ -634,6 +793,62 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig, *, thread_id: 
                 message_thread_id=thread_id,
             )
 
+    elif cmd == "/resume":
+        working_dir = bot.fixed_working_dir or sessions.default_dir
+        if args:
+            # Direct resume: /resume <session_id> [optional message]
+            parts = args.split(None, 1)
+            session_id = parts[0]
+            message = parts[1] if len(parts) > 1 else "Continue."
+
+            messages = read_session_messages(session_id, working_dir)
+            if messages is None:
+                await telegram.send_message(
+                    f"❌ Session introuvable : <code>{html.escape(session_id[:40])}</code>",
+                    chat_id=chat_id, parse_mode="HTML",
+                    api_url=bot.api_url, message_thread_id=thread_id,
+                )
+                return
+
+            await _resume_session(session_id, message, messages, working_dir, chat_id, bot, thread_id, is_topic_message)
+        else:
+            # Session picker: /resume (no args)
+            recent = list_recent_sessions(working_dir)
+            if not recent:
+                await telegram.send_message(
+                    "❌ Aucune session trouvée pour ce répertoire.",
+                    chat_id=chat_id, parse_mode="HTML",
+                    api_url=bot.api_url, message_thread_id=thread_id,
+                )
+                return
+
+            dir_name = Path(working_dir).name
+            buttons = []
+            for s in recent:
+                ts = s["timestamp"]
+                # Parse ISO timestamp to show date + time
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    label = dt.strftime("%d/%m %H:%M")
+                except (ValueError, AttributeError):
+                    label = "?"
+                # Truncate first message for button text
+                msg_preview = s["first_message"][:40].replace("\n", " ")
+                if len(s["first_message"]) > 40:
+                    msg_preview += "…"
+                buttons.append([{
+                    "text": f"{label} — {msg_preview}",
+                    "callback_data": f"resume:{s['id']}",
+                }])
+
+            await telegram.send_message(
+                f"📂 <b>{html.escape(dir_name)}</b> — Sessions récentes :\n\n"
+                "<i>Sélectionne une session à reprendre :</i>",
+                chat_id=chat_id, parse_mode="HTML",
+                reply_markup={"inline_keyboard": buttons},
+                api_url=bot.api_url, message_thread_id=thread_id,
+            )
+
     elif cmd == "/new":
         if args:
             if is_topic_message and thread_id:
@@ -656,15 +871,6 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig, *, thread_id: 
 
     elif cmd == "/dir":
         if args:
-            if is_topic_message:
-                await telegram.send_message(
-                    "⚠️ Utilise General pour changer de répertoire.",
-                    chat_id=chat_id,
-                    parse_mode="HTML",
-                    api_url=bot.api_url,
-                    message_thread_id=thread_id,
-                )
-                return
             session = sessions.switch_session(args)
             status = "🔄 running" if session.is_running else "💤 idle"
             conv = "in conversation" if session.is_in_conversation() else "fresh"
@@ -674,9 +880,10 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig, *, thread_id: 
             if not session.context_shown and not session.is_in_conversation():
                 context = session.get_session_context()
 
-            msg = f"📂 Switched to <code>{session.short_name}</code>\nStatus: {status} • {conv}"
+            msg = f"📂 Switched to <code>{session.short_name}</code>"
             if context:
-                msg += f"\n\n📜 <b>Previous context:</b>\n<i>{context}</i>"
+                msg += f"\n\n📜 <b>Previous session:</b>\n<i>{context}</i>"
+            msg += "\n\n<code>/resume</code> to resume a session\nor send a message to start a new one"
 
             await telegram.send_message(
                 msg,
@@ -686,31 +893,8 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig, *, thread_id: 
                 message_thread_id=thread_id,
             )
         else:
-            # Show session picker if sessions exist
-            session_list = sessions.list_sessions()
-            current = get_runner(bot, thread_id=thread_id or 0)
-            if len(session_list) > 1:
-                buttons = build_session_buttons(session_list, current)
-                await telegram.send_message(
-                    f"📂 Current: <code>{current.short_name}</code>\n\n"
-                    "Select or add new: <code>/dir projects/foo</code>\n"
-                    "<i>(paths are relative to home)</i>",
-                    chat_id=chat_id,
-                    parse_mode="HTML",
-                    reply_markup=buttons,
-                    api_url=bot.api_url,
-                    message_thread_id=thread_id,
-                )
-            else:
-                await telegram.send_message(
-                    f"📂 Current: <code>{current.short_name}</code>\n\n"
-                    "Usage: <code>/dir projects/foo</code>\n"
-                    "<i>(paths are relative to home)</i>",
-                    chat_id=chat_id,
-                    parse_mode="HTML",
-                    api_url=bot.api_url,
-                    message_thread_id=thread_id,
-                )
+            # Browse directories starting from home
+            await _send_dir_browser("", chat_id, bot, thread_id)
 
     elif cmd == "/dirs":
         dir_list = sessions.list_dirs()
@@ -892,9 +1076,28 @@ async def handle_callback(callback: dict, bot: BotConfig):
                 chat_id=str(chat_id), parse_mode="HTML", api_url=bot.api_url,
             )
 
+    elif data.startswith("browse:"):
+        rel_path = data.split(":", 1)[1]
+        msg_id = callback["message"]["message_id"]
+        await _send_dir_browser(rel_path, str(chat_id), bot, thread_id=None, edit_message_id=msg_id)
+
     elif data.startswith("dir:") or data.startswith("repo:"):
         # Handle both dir: and repo: callbacks the same way
         dir_path = data.split(":", 1)[1]  # Remove prefix
+        msg_id = callback["message"]["message_id"]
+
+        if dir_path == "_stay":
+            # User chose to stay in current directory
+            current_name = Path(sessions.default_dir).name
+            msg = (
+                f"📂 Staying in <code>{html.escape(current_name)}</code>\n\n"
+                f"<code>/resume</code> to resume a session\nor send a message to start a new one"
+            )
+            await telegram.edit_message(
+                msg_id, msg, chat_id=str(chat_id), parse_mode="HTML", api_url=bot.api_url,
+            )
+            return
+
         session = sessions.switch_session(dir_path)
         status = "🔄 running" if session.is_running else "💤 idle"
         conv = "in conversation" if session.is_in_conversation() else "fresh"
@@ -904,15 +1107,30 @@ async def handle_callback(callback: dict, bot: BotConfig):
         if not session.context_shown and not session.is_in_conversation():
             context = session.get_session_context()
 
-        msg = f"📂 Switched to <code>{session.short_name}</code>\nStatus: {status} • {conv}"
+        msg = f"📂 Switched to <code>{session.short_name}</code>"
         if context:
-            msg += f"\n\n📜 <b>Previous context:</b>\n<i>{context}</i>"
+            msg += f"\n\n📜 <b>Previous session:</b>\n<i>{context}</i>"
+        msg += "\n\n<code>/resume</code> to resume a session\nor send a message to start a new one"
 
-        await telegram.send_message(
-            msg,
-            chat_id=chat_id,
-            parse_mode="HTML",
-            api_url=bot.api_url,
+        # Edit the browser message in-place with confirmation
+        await telegram.edit_message(
+            msg_id, msg, chat_id=str(chat_id), parse_mode="HTML", api_url=bot.api_url,
+        )
+
+    elif data.startswith("resume:"):
+        session_id = data.split(":", 1)[1]
+        working_dir = bot.fixed_working_dir or sessions.default_dir
+        messages = read_session_messages(session_id, working_dir)
+        if messages is None:
+            await telegram.send_message(
+                f"❌ Session introuvable : <code>{html.escape(session_id[:40])}</code>",
+                chat_id=str(chat_id), parse_mode="HTML", api_url=bot.api_url,
+            )
+            return
+
+        await _resume_session(
+            session_id, "Continue.", messages, working_dir,
+            str(chat_id), bot, thread_id=None, is_topic_message=False,
         )
 
     elif data == "perm:allow":
@@ -1034,6 +1252,7 @@ async def run_claude(
     allowed_tools: list[str] | None = None,
     bypass_permissions: bool = False,
     thread_id: int | None = None,
+    new_session: bool = False,
 ):
     """Run Claude and send response to Telegram."""
     # Queued bot always bypasses permissions
@@ -1088,6 +1307,7 @@ async def run_claude(
         result = await runner.run(
             message,
             continue_session=continue_session,
+            new_session=new_session,
             allowed_tools=allowed_tools,
             bypass_permissions=bypass_permissions,
             system_prompt=bot.system_prompt,
@@ -1127,8 +1347,10 @@ async def run_claude(
                         title = None
 
                 if title:
-                    is_agent = bot.fixed_working_dir is not None
-                    new_name = format_topic_name(title, is_agent=is_agent)
+                    if bot.fixed_working_dir:
+                        new_name = format_topic_name(title, is_agent=True)
+                    else:
+                        new_name = format_topic_name(title, dir_name=working_dir_name(sessions.default_dir))
                     try:
                         await telegram.edit_forum_topic(chat_id, thread_id, new_name, api_url=bot.api_url)
                     except Exception as e:

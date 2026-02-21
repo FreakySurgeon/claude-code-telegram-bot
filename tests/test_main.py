@@ -60,7 +60,7 @@ async def test_handle_message_authorized(authorized_message):
     msg["message_thread_id"] = 42
     with patch("claude_telegram.main.run_claude", new_callable=AsyncMock) as mock_run:
         await handle_message(msg, bot)
-        mock_run.assert_called_once_with("Hello Claude", "12345", bot, continue_session=False, thread_id=42)
+        mock_run.assert_called_once_with("Hello Claude", "12345", bot, continue_session=False, thread_id=42, new_session=False)
 
 
 @pytest.mark.asyncio
@@ -224,15 +224,12 @@ async def test_handle_command_dir_with_path():
 
 @pytest.mark.asyncio
 async def test_handle_command_dir_no_args():
-    """Test /dir command without arguments."""
+    """Test /dir command without arguments shows directory browser."""
     bot = _make_dev_bot()
-    mock_runner = MagicMock()
-    mock_runner.short_name = "current"
-    with patch("claude_telegram.main.get_runner", return_value=mock_runner):
-        with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock) as mock_send:
-            await handle_command("/dir", "12345", bot)
-            assert "Current" in mock_send.call_args[0][0]
-            assert "current" in mock_send.call_args[0][0]
+    with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock) as mock_send:
+        await handle_command("/dir", "12345", bot)
+        msg = mock_send.call_args[0][0]
+        assert "Current" in msg
 
 
 @pytest.mark.asyncio
@@ -275,15 +272,15 @@ async def test_handle_callback_dir_switch():
     callback = {
         "id": "123",
         "data": "dir:/path/to/myproject",
-        "message": {"chat": {"id": 12345}},
+        "message": {"chat": {"id": 12345}, "message_id": 999},
     }
     with patch("claude_telegram.main.sessions") as mock_sessions:
         mock_sessions.switch_session = MagicMock(return_value=mock_session)
         with patch("claude_telegram.main.telegram.answer_callback", new_callable=AsyncMock):
-            with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock) as mock_send:
+            with patch("claude_telegram.main.telegram.edit_message", new_callable=AsyncMock) as mock_edit:
                 await handle_callback(callback, bot)
                 mock_sessions.switch_session.assert_called_once_with("/path/to/myproject")
-                assert "Switched" in mock_send.call_args[0][0]
+                assert "Switched" in mock_edit.call_args[0][1]
 
 
 @pytest.mark.asyncio

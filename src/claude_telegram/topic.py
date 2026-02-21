@@ -3,6 +3,7 @@
 import logging
 import re
 from datetime import datetime
+from pathlib import Path
 
 import httpx
 
@@ -14,9 +15,17 @@ OLLAMA_MODEL = "qwen3:4b"
 OLLAMA_TIMEOUT = 10
 
 
-def _today_prefix(*, is_agent: bool = False) -> str:
-    """Return '[Agent] DD/MM - ' or 'DD/MM - ' prefix for today."""
+def _today_prefix(*, dir_name: str | None = None, is_agent: bool = False) -> str:
+    """Return '[dir_name] DD/MM - ' or 'DD/MM - ' prefix for today.
+
+    Args:
+        dir_name: Working directory name (e.g. 'personal-org', 'thomas').
+                  If set, used as bracket prefix.
+        is_agent: Deprecated. If True and dir_name is None, uses '[Agent]'.
+    """
     d = datetime.now().strftime("%d/%m")
+    if dir_name:
+        return f"[{dir_name}] {d} - "
     if is_agent:
         return f"[Agent] {d} - "
     return f"{d} - "
@@ -27,17 +36,24 @@ def _strip_command(message: str) -> str:
     return re.sub(r"^/\S+\s*", "", message).strip()
 
 
-def generate_provisional_name(message: str, *, is_agent: bool = False) -> str:
+def working_dir_name(working_dir: str | None) -> str | None:
+    """Extract the last component of a working directory path."""
+    if not working_dir:
+        return None
+    return Path(working_dir).name or None
+
+
+def generate_provisional_name(message: str, *, dir_name: str | None = None, is_agent: bool = False) -> str:
     """Generate a provisional topic name from the first message.
 
-    Format: '[Agent] DD/MM - message...' or 'DD/MM - message...'
+    Format: '[dir_name] DD/MM - message...' or 'DD/MM - message...'
     Truncates so total length <= 128 chars (Telegram limit).
     """
     text = _strip_command(message)
     if not text:
         text = "Nouvelle conversation"
 
-    prefix = _today_prefix(is_agent=is_agent)
+    prefix = _today_prefix(dir_name=dir_name, is_agent=is_agent)
     max_text_len = MAX_TOPIC_NAME - len(prefix)
 
     if len(text) > max_text_len:
@@ -108,13 +124,13 @@ async def generate_title_fallback(message: str, response: str) -> str:
         return fallback
 
 
-def format_topic_name(title: str, *, is_agent: bool = False) -> str:
+def format_topic_name(title: str, *, dir_name: str | None = None, is_agent: bool = False) -> str:
     """Format a final topic name with date prefix.
 
-    Format: '[Agent] DD/MM - title' or 'DD/MM - title'
+    Format: '[dir_name] DD/MM - title' or 'DD/MM - title'
     Truncates to fit within 128 chars.
     """
-    prefix = _today_prefix(is_agent=is_agent)
+    prefix = _today_prefix(dir_name=dir_name, is_agent=is_agent)
     max_title_len = MAX_TOPIC_NAME - len(prefix)
 
     if len(title) > max_title_len:

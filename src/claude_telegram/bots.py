@@ -50,7 +50,7 @@ def create_bots() -> dict[str, BotConfig]:
         chat_id=settings.telegram_chat_id,
         use_queue=False,
         commands_whitelist=[
-            "/start", "/help", "/c", "/continue", "/new", "/dir", "/dirs",
+            "/start", "/help", "/c", "/continue", "/new", "/resume", "/dir", "/dirs",
             "/repos", "/rmdir", "/compact", "/cancel", "/status",
         ],
     )

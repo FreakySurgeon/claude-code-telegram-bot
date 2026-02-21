@@ -159,6 +159,10 @@ async def process_queue_item(
                     await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id)
                 else:
                     logger.info(f"{reminder_type} scan silent (no notable action, len={len(text)})")
+                    # Clean up session file to avoid polluting /resume history
+                    if result.session_id:
+                        from .claude import delete_session
+                        delete_session(result.session_id, runner.working_dir)
             elif result.text and "Claude/Urgent" in result.text:
                 await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id)
             else:

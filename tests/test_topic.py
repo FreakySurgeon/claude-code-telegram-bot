@@ -11,6 +11,7 @@ from claude_telegram.topic import (
     extract_title_from_response,
     generate_title_fallback,
     format_topic_name,
+    working_dir_name,
     MAX_TOPIC_NAME,
 )
 
@@ -45,16 +46,16 @@ class TestGenerateProvisionalName:
         assert len(result) <= MAX_TOPIC_NAME
         assert result.endswith("...")
 
-    def test_agent_prefix(self):
-        """Agent mode adds [Agent] prefix."""
-        result = generate_provisional_name("Test", is_agent=True)
-        assert result.startswith(f"[Agent] {FAKE_DATE} - ")
+    def test_dir_name_prefix(self):
+        """dir_name adds [name] prefix."""
+        result = generate_provisional_name("Test", dir_name="personal-org")
+        assert result.startswith(f"[personal-org] {FAKE_DATE} - ")
         assert "Test" in result
 
-    def test_dev_no_prefix(self):
-        """Dev mode has no [Agent] prefix."""
-        result = generate_provisional_name("Test", is_agent=False)
-        assert "[Agent]" not in result
+    def test_no_dir_name_no_prefix(self):
+        """No dir_name has no bracket prefix."""
+        result = generate_provisional_name("Test")
+        assert not result.startswith("[")
         assert result.startswith(f"{FAKE_DATE} - ")
 
     def test_command_prefix_stripped(self):
@@ -81,7 +82,7 @@ class TestGenerateProvisionalName:
     def test_result_within_limit(self):
         """Result never exceeds Telegram limit."""
         long_msg = "B" * 300
-        result = generate_provisional_name(long_msg, is_agent=True)
+        result = generate_provisional_name(long_msg, dir_name="personal-org")
         assert len(result) <= MAX_TOPIC_NAME
 
 
@@ -253,10 +254,10 @@ class TestFormatTopicName:
         result = format_topic_name("Mon sujet")
         assert result == f"{FAKE_DATE} - Mon sujet"
 
-    def test_agent_prefix(self):
-        """Agent mode adds [Agent] prefix."""
-        result = format_topic_name("Mon sujet", is_agent=True)
-        assert result == f"[Agent] {FAKE_DATE} - Mon sujet"
+    def test_dir_name_prefix(self):
+        """dir_name adds [name] prefix."""
+        result = format_topic_name("Mon sujet", dir_name="personal-org")
+        assert result == f"[personal-org] {FAKE_DATE} - Mon sujet"
 
     def test_long_title_truncated(self):
         """Long title is truncated with ellipsis."""
@@ -265,12 +266,12 @@ class TestFormatTopicName:
         assert len(result) <= MAX_TOPIC_NAME
         assert result.endswith("...")
 
-    def test_long_title_agent_truncated(self):
-        """Long title with agent prefix is still within limit."""
+    def test_long_title_dir_name_truncated(self):
+        """Long title with dir_name prefix is still within limit."""
         long_title = "Y" * 200
-        result = format_topic_name(long_title, is_agent=True)
+        result = format_topic_name(long_title, dir_name="personal-org")
         assert len(result) <= MAX_TOPIC_NAME
-        assert result.startswith("[Agent]")
+        assert result.startswith("[personal-org]")
         assert result.endswith("...")
 
     def test_exact_limit(self):
@@ -280,3 +281,22 @@ class TestFormatTopicName:
         result = format_topic_name(exact_title)
         assert len(result) == MAX_TOPIC_NAME
         assert "..." not in result
+
+
+# --- working_dir_name ---
+
+
+class TestWorkingDirName:
+    """Test working directory name extraction."""
+
+    def test_full_path(self):
+        assert working_dir_name("/home/thomas/projects/personal-org") == "personal-org"
+
+    def test_home_dir(self):
+        assert working_dir_name("/home/thomas") == "thomas"
+
+    def test_none(self):
+        assert working_dir_name(None) is None
+
+    def test_empty(self):
+        assert working_dir_name("") is None

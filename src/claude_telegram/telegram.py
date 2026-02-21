@@ -58,6 +58,7 @@ async def edit_message(
     parse_mode: str = "Markdown",
     api_url: str | None = None,
     message_thread_id: int | None = None,
+    reply_markup: dict | None = None,
 ) -> dict:
     """Edit an existing message."""
     api = api_url or DEFAULT_API_URL
@@ -73,6 +74,9 @@ async def edit_message(
 
     if message_thread_id is not None:
         payload["message_thread_id"] = message_thread_id
+
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
 
     async with httpx.AsyncClient() as client:
         response = await client.post(f"{api}/editMessageText", json=payload)

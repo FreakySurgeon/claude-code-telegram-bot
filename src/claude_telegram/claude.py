@@ -80,6 +80,124 @@ def find_latest_session(working_dir: str) -> str | None:
     return latest.stem
 
 
+def delete_session(session_id: str, working_dir: str) -> bool:
+    """Delete a session .jsonl file from disk. Returns True if deleted."""
+    project_dir = get_project_dir(working_dir)
+    if not project_dir:
+        return False
+    session_file = project_dir / f"{session_id}.jsonl"
+    if session_file.exists():
+        session_file.unlink()
+        logger.info(f"Deleted session file: {session_file.name}")
+        return True
+    return False
+
+
+def list_recent_sessions(working_dir: str, limit: int = 8) -> list[dict]:
+    """List recent sessions for a working directory.
+
+    Returns list of {"id": str, "timestamp": str, "first_message": str} dicts,
+    sorted by most recent first.
+    """
+    project_dir = get_project_dir(working_dir)
+    if not project_dir:
+        return []
+
+    session_files = sorted(
+        (f for f in project_dir.glob("*.jsonl")
+         if not f.name.startswith("agent-") and f.stat().st_size > 0),
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    )[:limit]
+
+    results = []
+    for sf in session_files:
+        timestamp = None
+        first_message = None
+        try:
+            with open(sf, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                        if data.get("type") == "queue-operation" and not timestamp:
+                            timestamp = data.get("timestamp", "")
+                        if data.get("type") == "user" and not first_message:
+                            content = data.get("message", {}).get("content", [])
+                            if isinstance(content, str):
+                                first_message = content.strip()
+                            elif isinstance(content, list):
+                                for c in content:
+                                    if isinstance(c, dict) and c.get("type") == "text":
+                                        first_message = c["text"].strip()
+                                        break
+                        if timestamp and first_message:
+                            break
+                    except json.JSONDecodeError:
+                        continue
+        except Exception:
+            continue
+
+        if first_message:
+            results.append({
+                "id": sf.stem,
+                "timestamp": timestamp or "",
+                "first_message": first_message,
+            })
+
+    return results
+
+
+def read_session_messages(session_id: str, working_dir: str, last_n: int = 5) -> list[dict] | None:
+    """Read last N user/assistant messages from a session file.
+
+    Returns list of {"role": "user"|"assistant", "text": str} or None if not found.
+    """
+    project_dir = get_project_dir(working_dir)
+    if not project_dir:
+        return None
+
+    session_file = project_dir / f"{session_id}.jsonl"
+    if not session_file.exists() or session_file.stat().st_size == 0:
+        return None
+
+    messages = []
+    try:
+        with open(session_file, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                    if data.get("type") == "user":
+                        content = data.get("message", {}).get("content", [])
+                        text = ""
+                        if isinstance(content, str):
+                            text = content.strip()
+                        elif isinstance(content, list):
+                            parts = []
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    parts.append(c["text"].strip())
+                            text = "\n".join(parts)
+                        if text and len(text) > 10 and not text.startswith("[Request"):
+                            messages.append({"role": "user", "text": text})
+                    elif data.get("type") == "assistant":
+                        content = data.get("message", {}).get("content", [])
+                        parts = []
+                        if isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    parts.append(c["text"].strip())
+                        text = "\n".join(parts)
+                        if text:
+                            messages.append({"role": "assistant", "text": text})
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        logger.warning(f"Failed to read session file {session_id}: {e}")
+        return None
+
+    return messages[-last_n:] if messages else []
+
+
 def get_session_permission_mode(working_dir: str) -> str | None:
     """Check if a session was started with bypass permissions mode."""
     project_dir = get_project_dir(working_dir)
@@ -143,9 +261,9 @@ class ClaudeRunner:
             return None
 
         latest = max(sessions, key=lambda f: f.stat().st_mtime)
-        self.session_id = latest.stem
 
-        # Read and parse user messages
+        # Read and parse user messages (read-only — do NOT set self.session_id here,
+        # session resumption is handled exclusively by run())
         messages = []
         try:
             with open(latest, "r", encoding="utf-8") as f:
@@ -231,18 +349,18 @@ class ClaudeRunner:
             if self.session_id:
                 # We already have a session ID from previous run
                 cmd.extend(["--resume", self.session_id])
-            elif self.working_dir:
-                # Try to find existing session for this directory
-                session_id = find_latest_session(self.working_dir)
-                if session_id:
-                    cmd.extend(["--resume", session_id])
-                    self.session_id = session_id
-                    logger.info(f"Resuming stored session {session_id} for {self.short_name}")
-                elif continue_session:
-                    # Fallback to --continue if explicitly requested
-                    cmd.append("--continue")
             elif continue_session:
-                cmd.append("--continue")
+                # Only search disk for sessions when explicitly continuing
+                if self.working_dir:
+                    session_id = find_latest_session(self.working_dir)
+                    if session_id:
+                        cmd.extend(["--resume", session_id])
+                        self.session_id = session_id
+                        logger.info(f"Resuming stored session {session_id} for {self.short_name}")
+                    else:
+                        cmd.append("--continue")
+                else:
+                    cmd.append("--continue")
 
         # Prompt is a positional argument, not a flag
         cmd.append(message)
@@ -327,7 +445,9 @@ class ClaudeRunner:
                 logger.debug(f"Non-JSON output: {decoded}")
                 continue
 
-        await self.current_process.wait()
+        proc = self.current_process
+        if proc:
+            await proc.wait()
         self.current_process = None
         self.last_interaction = datetime.now()
 
