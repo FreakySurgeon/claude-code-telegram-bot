@@ -443,3 +443,103 @@ def test_claude_result_defaults_no_error():
     result = ClaudeResult(text="hello")
     assert result.error is None
     assert result.is_quota_error is False
+
+
+class AsyncIterator:
+    """Helper for async iteration in tests."""
+    def __init__(self, items):
+        self.items = iter(items)
+    def __aiter__(self):
+        return self
+    async def __anext__(self):
+        try:
+            return next(self.items)
+        except StopIteration:
+            raise StopAsyncIteration
+
+
+@pytest.mark.asyncio
+async def test_execute_detects_error_event():
+    """Test that _execute parses error events from stream-json."""
+    runner = ClaudeRunner.__new__(ClaudeRunner)
+    runner.working_dir = "/tmp/test"
+    runner.session_id = None
+    runner.last_interaction = None
+
+    error_event = json.dumps({"type": "error", "error": {"message": "Your account has exceeded its quota"}})
+
+    proc = AsyncMock()
+    proc.stdout = AsyncIterator([error_event.encode()])
+    proc.wait = AsyncMock(return_value=1)
+    proc.returncode = 1
+    runner.current_process = proc
+
+    result = await runner._execute()
+    assert result.error is not None
+    assert "exceeded" in result.error.lower()
+    assert result.is_quota_error is True
+
+
+@pytest.mark.asyncio
+async def test_execute_detects_nonzero_returncode():
+    """Test that _execute flags error on non-zero exit with no result."""
+    runner = ClaudeRunner.__new__(ClaudeRunner)
+    runner.working_dir = "/tmp/test"
+    runner.session_id = None
+    runner.last_interaction = None
+
+    proc = AsyncMock()
+    proc.stdout = AsyncIterator([])
+    proc.wait = AsyncMock(return_value=1)
+    proc.returncode = 1
+    runner.current_process = proc
+
+    result = await runner._execute()
+    assert result.error is not None
+    assert "exit" in result.error.lower() or "code" in result.error.lower()
+
+
+@pytest.mark.asyncio
+async def test_execute_no_error_on_success():
+    """Test that _execute returns no error on successful run."""
+    runner = ClaudeRunner.__new__(ClaudeRunner)
+    runner.working_dir = "/tmp/test"
+    runner.session_id = None
+    runner.last_interaction = None
+
+    result_event = json.dumps({"type": "result", "result": "Hello!", "session_id": "abc123"})
+
+    proc = AsyncMock()
+    proc.stdout = AsyncIterator([result_event.encode()])
+    proc.wait = AsyncMock(return_value=0)
+    proc.returncode = 0
+    runner.current_process = proc
+
+    result = await runner._execute()
+    assert result.text == "Hello!"
+    assert result.error is None
+    assert result.is_quota_error is False
+
+
+@pytest.mark.asyncio
+async def test_execute_error_not_flagged_when_result_present():
+    """Test that error is not flagged when there is also a result text."""
+    runner = ClaudeRunner.__new__(ClaudeRunner)
+    runner.working_dir = "/tmp/test"
+    runner.session_id = None
+    runner.last_interaction = None
+
+    # An error event followed by a result event (non-fatal error)
+    error_event = json.dumps({"type": "error", "error": {"message": "rate limit warning"}})
+    result_event = json.dumps({"type": "result", "result": "Here is the response", "session_id": "abc"})
+
+    proc = AsyncMock()
+    proc.stdout = AsyncIterator([error_event.encode(), result_event.encode()])
+    proc.wait = AsyncMock(return_value=0)
+    proc.returncode = 0
+    runner.current_process = proc
+
+    result = await runner._execute()
+    assert result.text == "Here is the response"
+    assert result.error is None  # Not flagged because we got a result
+    assert result.is_quota_error is False

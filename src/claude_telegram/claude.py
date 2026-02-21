@@ -163,6 +163,7 @@ def read_session_messages(session_id: str, working_dir: str, last_n: int = 5) ->
         return None
 
     messages = []
+    CONTINUATION_MARKER = "continued from a previous conversation"
     try:
         with open(session_file, "r", encoding="utf-8") as f:
             for line in f:
@@ -179,6 +180,10 @@ def read_session_messages(session_id: str, working_dir: str, last_n: int = 5) ->
                                 if isinstance(c, dict) and c.get("type") == "text":
                                     parts.append(c["text"].strip())
                             text = "\n".join(parts)
+                        # Context compaction boundary — reset to only keep current segment
+                        if CONTINUATION_MARKER in text.lower()[:200]:
+                            messages.clear()
+                            continue
                         if text and len(text) > 10 and not text.startswith("[Request"):
                             messages.append({"role": "user", "text": text})
                     elif data.get("type") == "assistant":
@@ -410,6 +415,7 @@ class ClaudeRunner:
         accumulated_text = ""
         permission_denials = []
         result_session_id = None
+        error_message = None
 
         async for line in self.current_process.stdout:
             decoded = line.decode("utf-8", errors="replace").strip()
@@ -442,8 +448,19 @@ class ClaudeRunner:
                             if on_output:
                                 await on_output(text)
 
+                # Capture error events
+                if event_type == "error":
+                    err = event.get("error", {})
+                    if isinstance(err, dict):
+                        error_message = err.get("message", str(err))
+                    else:
+                        error_message = str(event.get("message", event.get("error", "unknown error")))
+                    logger.error(f"Claude error event: {error_message}")
+
             except json.JSONDecodeError:
-                # Not JSON, might be stderr or other output
+                # Capture meaningful non-JSON stderr output as potential error
+                if decoded and not error_message:
+                    error_message = decoded
                 logger.debug(f"Non-JSON output: {decoded}")
                 continue
 
@@ -452,6 +469,11 @@ class ClaudeRunner:
             await proc.wait()
         self.current_process = None
         self.last_interaction = datetime.now()
+
+        returncode = proc.returncode if proc else None
+        if returncode and returncode != 0 and not error_message:
+            error_message = f"Claude process exited with code {returncode}"
+            logger.warning(error_message)
 
         # Update session ID after run (but not for one-off new_session runs like email/cron)
         if not new_session:
@@ -466,10 +488,22 @@ class ClaudeRunner:
         if run_session_id:
             logger.info(f"Session ID for {self.short_name}: {run_session_id}")
 
+        # Detect quota-related errors
+        is_quota = False
+        if error_message:
+            lower = error_message.lower()
+            is_quota = any(kw in lower for kw in (
+                "quota", "billing", "rate_limit", "rate limit",
+                "overloaded", "credit", "exceeded", "limit",
+            ))
+
+        has_result = bool(result_text or accumulated_text)
         return ClaudeResult(
             text=result_text or accumulated_text,
             permission_denials=permission_denials,
             session_id=run_session_id,
+            error=error_message if not has_result else None,
+            is_quota_error=is_quota and not has_result,
         )
 
     async def _force_kill(self):
