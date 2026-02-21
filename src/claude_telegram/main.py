@@ -386,6 +386,12 @@ async def handle_message(message: dict, bot: BotConfig):
 
     # Handle commands
     if text.startswith("/"):
+        # Navigation commands always respond in General, even if sent from a topic
+        nav_commands = {"/dir", "/dirs", "/repos", "/resume", "/rmdir", "/start", "/help"}
+        cmd = text.split()[0].lower()
+        if cmd in nav_commands:
+            thread_id = None
+            is_topic_message = False
         await handle_command(text, chat_id, bot, thread_id=thread_id, is_topic_message=is_topic_message)
         return
 
