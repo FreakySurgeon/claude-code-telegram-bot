@@ -319,3 +319,49 @@ async def test_process_queue_item_success_clears_unavailable(mock_bot, tmp_path)
                                  persistent_queue=pqueue, api_status=api_status)
 
     assert api_status.unavailable is False
+
+
+@pytest.mark.asyncio
+async def test_full_unavailability_and_recovery_flow(mock_bot, tmp_path):
+    """Test: quota error → persist → recovery → replay."""
+    pqueue = PersistentQueue(tmp_path / "queue")
+    status = ApiStatus()
+    q = RequestQueue(maxsize=10)
+
+    # Phase 1: API returns quota error
+    item1 = QueueItem(prompt="Hello", source="telegram", chat_id="12345")
+    mock_runner = MagicMock()
+    mock_runner.run = AsyncMock(return_value=ClaudeResult(
+        text="", error="quota exceeded", is_quota_error=True,
+    ))
+    mock_runner.short_name = "gtd"
+
+    with patch("claude_telegram.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}), \
+         patch("claude_telegram.telegram.delete_message", new_callable=AsyncMock), \
+         patch("claude_telegram.main.send_response", new_callable=AsyncMock), \
+         patch("claude_telegram.main.animate_status", new_callable=AsyncMock), \
+         patch("claude_telegram.main.get_thinking_message", return_value="✨"):
+        await process_queue_item(item1, mock_runner, mock_bot, queue=q,
+                                 persistent_queue=pqueue, api_status=status)
+
+    assert status.unavailable is True
+    assert pqueue.size == 1
+
+    # Phase 2: API recovers — a new message succeeds
+    mock_runner.run = AsyncMock(return_value=ClaudeResult(text="I'm back!", permission_denials=[]))
+    item2 = QueueItem(prompt="New message", source="telegram", chat_id="12345")
+
+    with patch("claude_telegram.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 2}}), \
+         patch("claude_telegram.telegram.delete_message", new_callable=AsyncMock), \
+         patch("claude_telegram.main.send_response", new_callable=AsyncMock) as mock_send, \
+         patch("claude_telegram.main.animate_status", new_callable=AsyncMock), \
+         patch("claude_telegram.main.get_thinking_message", return_value="✨"):
+        await process_queue_item(item2, mock_runner, mock_bot, queue=q,
+                                 persistent_queue=pqueue, api_status=status)
+
+    # API should be marked as available again
+    assert status.unavailable is False
+    # Response was sent for the new message
+    mock_send.assert_called()
+    # Note: persistent queue items are replayed by queue_worker, not by process_queue_item.
+    # The queue still has 1 item (the persisted one), but api_status is cleared.
