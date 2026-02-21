@@ -579,23 +579,29 @@ async def _resume_session(
             api_url=bot.api_url, message_thread_id=thread_id,
         )
 
-    # Now update the General message (notification or new) with same style as "Claude has completed"
+    # Update the General message with confirmation + "Go to topic" button
     dir_name = working_dir_name(working_dir)
     general_text = f"✅ <b>Session resumed</b> (<code>{html.escape(dir_name)}</code>)"
+    goto_markup = {"inline_keyboard": [[
+        {"text": "Go to topic ➜", "callback_data": f"goto:{thread_id}"},
+    ]]}
     if source_message_id:
         try:
             await telegram.edit_message(
                 source_message_id, general_text,
                 chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                reply_markup=goto_markup,
             )
         except Exception as e:
             logger.warning(f"Failed to edit source message: {e}")
             await telegram.send_message(
                 general_text, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                reply_markup=goto_markup,
             )
     else:
         await telegram.send_message(
             general_text, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+            reply_markup=goto_markup,
         )
 
     # Set session_id on the runner so next message in this topic continues the session
@@ -1140,6 +1146,20 @@ async def handle_callback(callback: dict, bot: BotConfig):
         await telegram.answer_callback(query_id, api_url=bot.api_url)
     except Exception:
         pass
+
+    if data.startswith("goto:"):
+        # Send a message in the target topic to trigger Telegram's native
+        # "Continue to last topic" button in the user's current view
+        try:
+            target_thread = int(data.split(":", 1)[1])
+            await telegram.send_message(
+                "⬆️ <i>Topic is ready — type your message here</i>",
+                chat_id=str(chat_id), parse_mode="HTML", api_url=bot.api_url,
+                message_thread_id=target_thread,
+            )
+        except Exception:
+            pass
+        return
 
     if data.startswith("reply:"):
         reply = data[6:]  # Remove "reply:" prefix
