@@ -487,8 +487,8 @@ async def _resume_session(
     if not is_topic_message:
         # Use first user message as topic name
         first_msg = next((m["text"] for m in messages if m["role"] == "user"), message)
-        dir_name = working_dir_name(working_dir) if not bot.fixed_working_dir else None
-        name = generate_provisional_name(first_msg, dir_name=dir_name, is_agent=bool(bot.fixed_working_dir))
+        dir_name = working_dir_name(working_dir)
+        name = generate_provisional_name(first_msg, dir_name=dir_name, is_agent=False)
         try:
             result = await telegram.create_forum_topic(chat_id, name, api_url=bot.api_url)
             thread_id = result["result"]["message_thread_id"]
@@ -1780,76 +1780,6 @@ async def _process_email(data: dict, bot: BotConfig):
             )
 
 
-@app.post("/cron/{reminder_type}")
-async def cron_reminder(reminder_type: str):
-    """Handle cron reminders (morning/evening/weekly)."""
-    prompt = _load_cron_prompt(reminder_type)
-    if not prompt:
-        return {"error": f"Unknown reminder type: {reminder_type}"}
-
-    gtd_bot = bots.get("gtd")
-    if not gtd_bot:
-        return {"error": "GTD bot not configured"}
-
-    # Process asynchronously so curl returns immediately
-    asyncio.create_task(_process_cron(prompt, reminder_type, gtd_bot))
-
-    return {"status": "accepted", "type": reminder_type}
-
-
-async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
-    """Process a cron reminder via Claude GTD."""
-    logger.info(f"Processing cron reminder: {reminder_type}")
-
-    # Silent crons don't create topics
-    silent = reminder_type in ("whatsapp", "gdrive-inbox")
-    thread_id = None
-
-    if not silent:
-        name = generate_provisional_name(f"Cron: {reminder_type}", is_agent=True)
-        try:
-            result = await telegram.create_forum_topic(bot.chat_id, name, api_url=bot.api_url)
-            thread_id = result["result"]["message_thread_id"]
-        except Exception as e:
-            logger.warning(f"Failed to create topic for cron {reminder_type}: {e}")
-
-    if gtd_queue is not None:
-        item = QueueItem(
-            prompt=prompt,
-            source="cron",
-            chat_id=bot.chat_id,
-            new_session=True,
-            timeout=600,  # 10 min for cron (MCP-heavy: Trello + Calendar)
-            metadata={"reminder_type": reminder_type},
-            thread_id=thread_id,
-        )
-        added = await gtd_queue.enqueue(item)
-        if not added:
-            logger.warning(f"Queue full, skipping cron {reminder_type}")
-    else:
-        # Fallback: direct execution
-        try:
-            runner = get_runner(bot, thread_id=thread_id or 0)
-            result = await runner.run(
-                prompt,
-                new_session=True,
-                bypass_permissions=True,
-                system_prompt=bot.system_prompt,
-                mcp_config=bot.mcp_config_path,
-            )
-            if result.text:
-                await send_response(result.text, bot.chat_id, session_name="gtd", api_url=bot.api_url, message_thread_id=thread_id)
-        except Exception as e:
-            logger.exception(f"Cron reminder error ({reminder_type})")
-            await telegram.send_message(
-                f"❌ Erreur rappel {reminder_type}: <code>{e}</code>",
-                chat_id=bot.chat_id,
-                parse_mode="HTML",
-                api_url=bot.api_url,
-                message_thread_id=thread_id,
-            )
-
-
 @app.post("/cron/calendar-actions")
 async def cron_calendar_actions():
     """Scan tomorrow's calendar for <agent> prompts and execute them."""
@@ -2010,6 +1940,76 @@ async def _process_calendar_actions(bot: BotConfig):
                 logger.warning("Calendar actions: queue unavailable, skipping execution")
 
     logger.info(f"Calendar actions: {enqueued} actions enqueued from {len(events)} events")
+
+
+@app.post("/cron/{reminder_type}")
+async def cron_reminder(reminder_type: str):
+    """Handle cron reminders (morning/evening/weekly)."""
+    prompt = _load_cron_prompt(reminder_type)
+    if not prompt:
+        return {"error": f"Unknown reminder type: {reminder_type}"}
+
+    gtd_bot = bots.get("gtd")
+    if not gtd_bot:
+        return {"error": "GTD bot not configured"}
+
+    # Process asynchronously so curl returns immediately
+    asyncio.create_task(_process_cron(prompt, reminder_type, gtd_bot))
+
+    return {"status": "accepted", "type": reminder_type}
+
+
+async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
+    """Process a cron reminder via Claude GTD."""
+    logger.info(f"Processing cron reminder: {reminder_type}")
+
+    # Silent crons don't create topics
+    silent = reminder_type in ("whatsapp", "gdrive-inbox")
+    thread_id = None
+
+    if not silent:
+        name = generate_provisional_name(f"Cron: {reminder_type}", is_agent=True)
+        try:
+            result = await telegram.create_forum_topic(bot.chat_id, name, api_url=bot.api_url)
+            thread_id = result["result"]["message_thread_id"]
+        except Exception as e:
+            logger.warning(f"Failed to create topic for cron {reminder_type}: {e}")
+
+    if gtd_queue is not None:
+        item = QueueItem(
+            prompt=prompt,
+            source="cron",
+            chat_id=bot.chat_id,
+            new_session=True,
+            timeout=600,  # 10 min for cron (MCP-heavy: Trello + Calendar)
+            metadata={"reminder_type": reminder_type},
+            thread_id=thread_id,
+        )
+        added = await gtd_queue.enqueue(item)
+        if not added:
+            logger.warning(f"Queue full, skipping cron {reminder_type}")
+    else:
+        # Fallback: direct execution
+        try:
+            runner = get_runner(bot, thread_id=thread_id or 0)
+            result = await runner.run(
+                prompt,
+                new_session=True,
+                bypass_permissions=True,
+                system_prompt=bot.system_prompt,
+                mcp_config=bot.mcp_config_path,
+            )
+            if result.text:
+                await send_response(result.text, bot.chat_id, session_name="gtd", api_url=bot.api_url, message_thread_id=thread_id)
+        except Exception as e:
+            logger.exception(f"Cron reminder error ({reminder_type})")
+            await telegram.send_message(
+                f"❌ Erreur rappel {reminder_type}: <code>{e}</code>",
+                chat_id=bot.chat_id,
+                parse_mode="HTML",
+                api_url=bot.api_url,
+                message_thread_id=thread_id,
+            )
 
 
 @app.post("/test")
