@@ -21,6 +21,8 @@ class BotConfig:
     use_queue: bool = False
     commands_whitelist: list[str] = field(default_factory=list)
 
+    username: str | None = None  # Populated at startup via getMe
+
     @property
     def api_url(self) -> str:
         return f"https://api.telegram.org/bot{self.token}"

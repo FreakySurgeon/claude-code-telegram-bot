@@ -233,6 +233,15 @@ async def get_chat(
         return response.json()
 
 
+async def get_me(api_url: str | None = None) -> dict:
+    """Get bot info via getMe."""
+    api = api_url or DEFAULT_API_URL
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{api}/getMe")
+        response.raise_for_status()
+        return response.json()
+
+
 def is_authorized(chat_id: str | int) -> bool:
     """Check if the chat is authorized."""
     return str(chat_id) == str(settings.telegram_chat_id)

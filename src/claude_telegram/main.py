@@ -75,7 +75,7 @@ def get_continue_message() -> str:
     return f"🔄 <i>{verb}...</i>"
 
 from . import telegram
-from .claude import sessions, ClaudeResult, PermissionDenial, get_session_permission_mode, list_recent_sessions, read_session_messages
+from .claude import sessions, ClaudeResult, PermissionDenial, get_session_permission_mode, list_recent_sessions, read_session_messages, find_session_working_dir
 from .config import settings
 from .markdown import markdown_to_telegram_html
 from .tunnel import tunnel, CloudflareTunnel
@@ -93,6 +93,9 @@ pending_permissions: dict[str, dict] = {}  # chat_id -> {message, denials, sessi
 # Store pending voice transcription texts (callback_data limited to 64 bytes)
 pending_voice_texts: dict[str, str] = {}  # chat_id -> full transcription text
 
+# Store working_dir for resume callbacks (callback_data too small for full path)
+resume_working_dirs: dict[str, str] = {}  # session_id -> working_dir
+
 # Bot configurations (initialized at startup)
 bots: dict[str, BotConfig] = {}
 
@@ -109,7 +112,15 @@ persistent_queue: PersistentQueue | None = None
 api_status: ApiStatus | None = None
 
 def get_runner(bot: BotConfig, thread_id: int = 0):
-    """Get the runner for a bot + thread combination."""
+    """Get the runner for a bot + thread combination.
+
+    For the dev bot (no fixed_working_dir), a thread may have been created
+    in a specific directory via /resume. Check existing sessions first.
+    """
+    if thread_id and not bot.fixed_working_dir:
+        existing = sessions.find_by_thread(thread_id)
+        if existing:
+            return existing
     working_dir = bot.fixed_working_dir or sessions.default_dir
     return sessions.get_session(working_dir, thread_id=thread_id)
 
@@ -176,6 +187,13 @@ async def lifespan(app: FastAPI):
     bots = create_bots()
     for bot_name, bot in bots.items():
         chat_to_bot[str(bot.chat_id)] = bot_name
+        # Fetch bot username via getMe
+        try:
+            me = await telegram.get_me(api_url=bot.api_url)
+            bot.username = me.get("result", {}).get("username")
+            logger.info(f"Bot {bot_name}: @{bot.username}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch username for {bot_name}: {e}")
     logger.info(f"Initialized bots: {list(bots.keys())}")
 
     mode = settings.mode
@@ -541,32 +559,24 @@ async def _resume_session(
             )
             return
 
-        # Build topic deep link
-        numeric_chat_id = str(chat_id).lstrip("-")
-        if numeric_chat_id.startswith("100"):
-            numeric_chat_id = numeric_chat_id[3:]
-        topic_url = f"https://t.me/c/{numeric_chat_id}/{thread_id}"
-
+        # Update the source message (notification) with the topic name.
+        # The recap message sent to the topic below triggers Telegram's native
+        # "Continue to last topic" button, which reliably navigates the user.
+        topic_text = f"📂 {html.escape(name)}"
         if source_message_id:
-            # Edit the source message (e.g. notification) to replace button with topic link
             try:
-                link_text = f"📂 <a href=\"{topic_url}\">{html.escape(name)}</a>"
                 await telegram.edit_message(
-                    source_message_id, link_text,
+                    source_message_id, topic_text,
                     chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
                 )
             except Exception as e:
                 logger.warning(f"Failed to edit source message: {e}")
-                # Fall back to sending a new message
                 await telegram.send_message(
-                    f"📂 <a href=\"{topic_url}\">{html.escape(name)}</a>",
-                    chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                    topic_text, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
                 )
         else:
-            # Send clickable link in General so user can navigate to the new topic
             await telegram.send_message(
-                f"📂 <a href=\"{topic_url}\">{html.escape(name)}</a>",
-                chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+                topic_text, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
             )
 
     # Show message recap in the topic
@@ -588,10 +598,9 @@ async def _resume_session(
             api_url=bot.api_url, message_thread_id=thread_id,
         )
 
-    # Set session_id on the runner and run
-    runner = get_runner(bot, thread_id=thread_id or 0)
+    # Set session_id on the runner so next message in this topic continues the session
+    runner = sessions.get_session(working_dir, thread_id=thread_id or 0)
     runner.session_id = session_id
-    await run_claude(message, chat_id, bot, continue_session=False, thread_id=thread_id)
 
 
 async def handle_voice(message: dict, bot: BotConfig, *, thread_id: int | None = None):
@@ -1125,8 +1134,11 @@ async def handle_callback(callback: dict, bot: BotConfig):
         logger.warning(f"Unauthorized callback from {chat_id}")
         return
 
-    # Answer the callback to remove loading state
-    await telegram.answer_callback(query_id, api_url=bot.api_url)
+    # Answer the callback to remove loading state (may fail for stale queries after restart)
+    try:
+        await telegram.answer_callback(query_id, api_url=bot.api_url)
+    except Exception:
+        pass
 
     if data.startswith("reply:"):
         reply = data[6:]  # Remove "reply:" prefix
@@ -1188,7 +1200,16 @@ async def handle_callback(callback: dict, bot: BotConfig):
     elif data.startswith("resume:"):
         session_id = data.split(":", 1)[1]
         msg_id = callback["message"]["message_id"]
-        working_dir = bot.fixed_working_dir or sessions.default_dir
+        # Use stored working_dir from notification, fall back to scanning all projects
+        working_dir = resume_working_dirs.pop(session_id, None)
+        source = "resume_working_dirs"
+        if not working_dir:
+            working_dir = find_session_working_dir(session_id)
+            source = "find_session_working_dir"
+        if not working_dir:
+            working_dir = bot.fixed_working_dir or sessions.default_dir
+            source = "fallback"
+        logger.info(f"resume: session_id={session_id}, working_dir={working_dir} (source={source})")
         messages = read_session_messages(session_id, working_dir, last_n=10)
         if messages is None:
             await telegram.send_message(
@@ -1323,13 +1344,17 @@ async def run_claude(
     bypass_permissions: bool = False,
     thread_id: int | None = None,
     new_session: bool = False,
+    working_dir: str | None = None,
 ):
     """Run Claude and send response to Telegram."""
     # Queued bot always bypasses permissions
     if bot.use_queue:
         bypass_permissions = True
 
-    runner = get_runner(bot, thread_id=thread_id or 0)
+    if working_dir:
+        runner = sessions.get_session(working_dir, thread_id=thread_id or 0)
+    else:
+        runner = get_runner(bot, thread_id=thread_id or 0)
     session_name = runner.short_name
     prefix = f"[<code>{session_name}</code>] " if session_name != "default" else ""
 
@@ -1652,12 +1677,10 @@ async def notify(event_type: str, request: Request):
 
     logger.info(f"notify/{event_type}: working_dir={working_dir}, session_id={session_id}, has_summary={summary is not None}")
 
-    # Determine which bot to notify based on working_dir
+    # Always notify via dev bot — hook.py already skips bot-triggered sessions
+    # (CLAUDE_TELEGRAM_BOT env check), so /notify only fires for external CLI
+    # sessions (VS Code etc.) which should always go to the dev bot.
     target_bot = bots.get("dev")
-    if working_dir and bots.get("gtd"):
-        gtd_bot = bots["gtd"]
-        if gtd_bot.fixed_working_dir and working_dir.startswith(gtd_bot.fixed_working_dir):
-            target_bot = gtd_bot
 
     if not target_bot:
         return {"ok": False, "error": "No bot configured"}
@@ -1688,6 +1711,9 @@ async def notify(event_type: str, request: Request):
             reply_markup = {"inline_keyboard": [[
                 {"text": "Continue ➜", "callback_data": f"resume:{session_id}"},
             ]]}
+            # Store working_dir for the resume callback (can't fit in callback_data)
+            if working_dir:
+                resume_working_dirs[session_id] = working_dir
     elif event_type == "waiting":
         msg = "⏸ Claude is waiting for input."
     else:

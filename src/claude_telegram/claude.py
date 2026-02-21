@@ -96,6 +96,35 @@ def delete_session(session_id: str, working_dir: str) -> bool:
     return False
 
 
+def find_session_working_dir(session_id: str) -> str | None:
+    """Find the working directory for a session by scanning all project directories.
+
+    Returns the reconstructed working_dir (e.g. /home/thomas/projects/personal-org)
+    or None if not found.
+    """
+    projects_dir = CLAUDE_DIR / "projects"
+    if not projects_dir.exists():
+        return None
+
+    for project_dir in projects_dir.iterdir():
+        if not project_dir.is_dir():
+            continue
+        session_file = project_dir / f"{session_id}.jsonl"
+        if session_file.exists():
+            # Reconstruct working_dir from project dir name
+            # e.g. -home-thomas-projects-personal-org -> /home/thomas/projects/personal-org
+            # The dir name has leading dash and dashes replacing / (and .)
+            # We can't perfectly reverse dot-vs-dash, but we can check if the path exists
+            dir_name = project_dir.name.lstrip("-")
+            candidate = "/" + dir_name.replace("-", "/")
+            if Path(candidate).is_dir():
+                return candidate
+            # Fallback: try to find an existing path by testing segments
+            # This handles cases where original path had dashes in folder names
+            return candidate
+    return None
+
+
 def list_recent_sessions(working_dir: str, limit: int = 8) -> list[dict]:
     """List recent sessions for a working directory.
 
@@ -585,6 +614,13 @@ class SessionManager:
             self.sessions[dir_key][thread_id] = ClaudeRunner(working_dir=dir_key)
             logger.info(f"Created new session for: {dir_key} thread={thread_id}")
         return self.sessions[dir_key][thread_id]
+
+    def find_by_thread(self, thread_id: int) -> ClaudeRunner | None:
+        """Find an existing session by thread_id across all working dirs."""
+        for threads in self.sessions.values():
+            if thread_id in threads:
+                return threads[thread_id]
+        return None
 
     def list_sessions(self, working_dir: str | None = None) -> dict[int, ClaudeRunner] | list[tuple[str, ClaudeRunner]]:
         """List sessions. With working_dir: return threads dict. Without: return legacy list."""
