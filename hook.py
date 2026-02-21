@@ -49,8 +49,9 @@ def get_project_dir(working_dir: str) -> Path | None:
         return None
 
     # Convert path to Claude's format: /home/foo/bar -> -home-foo-bar
+    # Claude also replaces dots with dashes
     abs_path = str(Path(working_dir).resolve())
-    claude_dir_name = abs_path.replace("/", "-")
+    claude_dir_name = abs_path.replace("/", "-").replace(".", "-")
 
     project_path = projects_dir / claude_dir_name
     if project_path.exists() and project_path.is_dir():
