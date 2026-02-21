@@ -26,6 +26,8 @@ class ClaudeResult:
     text: str
     permission_denials: list[PermissionDenial] = field(default_factory=list)
     session_id: str | None = None
+    error: str | None = None
+    is_quota_error: bool = False
 
 logger = logging.getLogger(__name__)
 

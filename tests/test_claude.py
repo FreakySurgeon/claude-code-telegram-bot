@@ -429,3 +429,17 @@ async def test_force_kill_normal_pgid():
         # Should NOT have called proc.terminate()
         mock_proc.terminate.assert_not_called()
     assert runner.current_process is None
+
+
+def test_claude_result_error_fields():
+    """Test ClaudeResult includes error fields."""
+    result = ClaudeResult(text="", error="quota_exceeded", is_quota_error=True)
+    assert result.error == "quota_exceeded"
+    assert result.is_quota_error is True
+
+
+def test_claude_result_defaults_no_error():
+    """Test ClaudeResult defaults to no error."""
+    result = ClaudeResult(text="hello")
+    assert result.error is None
+    assert result.is_quota_error is False
