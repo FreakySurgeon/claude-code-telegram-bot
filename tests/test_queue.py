@@ -4,7 +4,7 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from claude_telegram.queue import QueueItem, RequestQueue, process_queue_item
+from claude_telegram.queue import QueueItem, RequestQueue, process_queue_item, PersistentQueue
 from claude_telegram.claude import ClaudeResult
 
 
@@ -173,3 +173,71 @@ async def test_process_queue_item_timeout_no_second_retry(mock_bot):
         await process_queue_item(item, mock_runner, mock_bot, queue=q)
 
     assert q.size == 0
+
+
+@pytest.fixture
+def pqueue(tmp_path):
+    return PersistentQueue(tmp_path / "queue")
+
+
+def test_persistent_queue_save_and_list(pqueue):
+    """Test saving and listing queue items."""
+    item = QueueItem(prompt="Hello", source="telegram", chat_id="123")
+    pqueue.save(item)
+    items = pqueue.list_items()
+    assert len(items) == 1
+    assert items[0].prompt == "Hello"
+
+
+def test_persistent_queue_fifo_order(pqueue):
+    """Test items are returned in FIFO order."""
+    import time
+    for i in range(3):
+        pqueue.save(QueueItem(prompt=f"msg{i}", source="telegram", chat_id="123"))
+        time.sleep(0.01)  # ensure different timestamps
+    items = pqueue.list_items()
+    assert [i.prompt for i in items] == ["msg0", "msg1", "msg2"]
+
+
+def test_persistent_queue_delete(pqueue):
+    """Test deleting a processed item."""
+    item = QueueItem(prompt="Hello", source="telegram", chat_id="123")
+    path = pqueue.save(item)
+    assert pqueue.size > 0
+    pqueue.delete(path)
+    assert pqueue.size == 0
+
+
+def test_persistent_queue_cron_dedup(pqueue):
+    """Test cron deduplication replaces existing."""
+    item1 = QueueItem(prompt="old scan", source="cron", chat_id="123", metadata={"reminder_type": "whatsapp"})
+    item2 = QueueItem(prompt="new scan", source="cron", chat_id="123", metadata={"reminder_type": "whatsapp"})
+    pqueue.save(item1)
+    pqueue.save(item2)
+    items = pqueue.list_items()
+    assert len(items) == 1
+    assert items[0].prompt == "new scan"
+
+
+def test_persistent_queue_no_dedup_different_crons(pqueue):
+    """Test different cron types are not deduped."""
+    item1 = QueueItem(prompt="whatsapp", source="cron", chat_id="123", metadata={"reminder_type": "whatsapp"})
+    item2 = QueueItem(prompt="morning", source="cron", chat_id="123", metadata={"reminder_type": "morning"})
+    pqueue.save(item1)
+    pqueue.save(item2)
+    assert pqueue.size == 2
+
+
+def test_persistent_queue_no_dedup_telegram(pqueue):
+    """Test telegram messages are never deduped."""
+    pqueue.save(QueueItem(prompt="msg1", source="telegram", chat_id="123"))
+    pqueue.save(QueueItem(prompt="msg2", source="telegram", chat_id="123"))
+    assert pqueue.size == 2
+
+
+def test_persistent_queue_creates_directory(tmp_path):
+    """Test queue creates directory if it doesn't exist."""
+    pq = PersistentQueue(tmp_path / "nonexistent" / "queue")
+    item = QueueItem(prompt="Hello", source="telegram", chat_id="123")
+    pq.save(item)
+    assert pq.size == 1

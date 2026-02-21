@@ -1,8 +1,10 @@
 """Request queue for serializing Claude requests."""
 
 import asyncio
+import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -93,6 +95,92 @@ class RequestQueue:
     @property
     def is_empty(self) -> bool:
         return self._queue.empty()
+
+
+class PersistentQueue:
+    """File-based persistent queue for messages during API unavailability.
+
+    Each item is stored as a JSON file in the queue directory.
+    Filenames are timestamped for FIFO ordering.
+    Cron items are deduplicated by reminder_type.
+    """
+
+    def __init__(self, queue_dir: Path):
+        self.queue_dir = Path(queue_dir)
+        self.queue_dir.mkdir(parents=True, exist_ok=True)
+
+    def save(self, item: QueueItem) -> Path:
+        """Persist a queue item to disk. Returns the file path."""
+        reminder_type = item.metadata.get("reminder_type", "")
+
+        # Dedup crons: remove existing file for same cron type
+        if item.source == "cron" and reminder_type:
+            for existing in self.queue_dir.glob(f"*-cron-{reminder_type}.json"):
+                existing.unlink()
+
+        # Build filename (nanosecond precision to avoid collisions)
+        ts = f"{time.time_ns()}"
+        if item.source == "cron" and reminder_type:
+            filename = f"{ts}-cron-{reminder_type}.json"
+        else:
+            filename = f"{ts}-{item.source}.json"
+
+        data = {
+            "prompt": item.prompt,
+            "source": item.source,
+            "chat_id": item.chat_id,
+            "metadata": item.metadata,
+            "continue_session": item.continue_session,
+            "bypass_permissions": item.bypass_permissions,
+            "new_session": item.new_session,
+            "allowed_tools": item.allowed_tools,
+            "timeout": item.timeout,
+            "thread_id": item.thread_id,
+            "queued_at": datetime.now().isoformat(),
+        }
+
+        path = self.queue_dir / filename
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        return path
+
+    def list_items(self) -> list[QueueItem]:
+        """List all queued items in FIFO order."""
+        files = sorted(self.queue_dir.glob("*.json"))
+        items = []
+        for f in files:
+            try:
+                data = json.loads(f.read_text())
+                items.append(QueueItem(
+                    prompt=data["prompt"],
+                    source=data["source"],
+                    chat_id=data["chat_id"],
+                    metadata=data.get("metadata", {}),
+                    continue_session=data.get("continue_session", False),
+                    bypass_permissions=data.get("bypass_permissions", True),
+                    new_session=data.get("new_session", True),
+                    allowed_tools=data.get("allowed_tools"),
+                    timeout=data.get("timeout", 300),
+                    thread_id=data.get("thread_id"),
+                ))
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(f"Skipping corrupt queue file {f}: {e}")
+        return items
+
+    def list_files(self) -> list[Path]:
+        """List all queue files in FIFO order."""
+        return sorted(self.queue_dir.glob("*.json"))
+
+    def delete(self, path: Path):
+        """Delete a processed queue file."""
+        path.unlink(missing_ok=True)
+
+    @property
+    def size(self) -> int:
+        return len(list(self.queue_dir.glob("*.json")))
+
+    @property
+    def is_empty(self) -> bool:
+        return self.size == 0
 
 
 async def process_queue_item(
