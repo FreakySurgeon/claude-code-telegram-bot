@@ -4,7 +4,7 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from claude_telegram.queue import QueueItem, RequestQueue, process_queue_item, PersistentQueue
+from claude_telegram.queue import QueueItem, RequestQueue, process_queue_item, PersistentQueue, ApiStatus
 from claude_telegram.claude import ClaudeResult
 
 
@@ -241,3 +241,81 @@ def test_persistent_queue_creates_directory(tmp_path):
     item = QueueItem(prompt="Hello", source="telegram", chat_id="123")
     pq.save(item)
     assert pq.size == 1
+
+
+def test_api_status_default():
+    """Test ApiStatus starts as available."""
+    status = ApiStatus()
+    assert status.unavailable is False
+    assert status.since is None
+    assert status.last_error is None
+
+
+def test_api_status_mark_unavailable():
+    """Test marking API as unavailable."""
+    status = ApiStatus()
+    status.mark_unavailable("quota exceeded")
+    assert status.unavailable is True
+    assert status.last_error == "quota exceeded"
+    assert status.since is not None
+
+
+def test_api_status_mark_available():
+    """Test marking API as available again."""
+    status = ApiStatus()
+    status.mark_unavailable("quota exceeded")
+    status.mark_available()
+    assert status.unavailable is False
+    assert status.since is None
+    assert status.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_process_queue_item_quota_error_persists(mock_bot, tmp_path):
+    """Test that quota error persists item to disk and sets unavailable."""
+    pqueue = PersistentQueue(tmp_path / "queue")
+    api_status = ApiStatus()
+
+    item = QueueItem(prompt="Hello", source="telegram", chat_id="12345")
+    mock_runner = MagicMock()
+    mock_runner.run = AsyncMock(return_value=ClaudeResult(
+        text="", error="quota exceeded", is_quota_error=True,
+    ))
+    mock_runner.short_name = "gtd"
+
+    with patch("claude_telegram.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}) as mock_send, \
+         patch("claude_telegram.telegram.delete_message", new_callable=AsyncMock), \
+         patch("claude_telegram.main.send_response", new_callable=AsyncMock), \
+         patch("claude_telegram.main.animate_status", new_callable=AsyncMock), \
+         patch("claude_telegram.main.get_thinking_message", return_value="✨"):
+        await process_queue_item(item, mock_runner, mock_bot,
+                                 persistent_queue=pqueue, api_status=api_status)
+
+    assert api_status.unavailable is True
+    assert pqueue.size == 1
+    # Should have sent the first-detection notification
+    calls = [str(c) for c in mock_send.call_args_list]
+    assert any("épuisés" in c for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_process_queue_item_success_clears_unavailable(mock_bot, tmp_path):
+    """Test that successful processing clears the unavailable flag."""
+    pqueue = PersistentQueue(tmp_path / "queue")
+    api_status = ApiStatus()
+    api_status.mark_unavailable("quota exceeded")
+
+    item = QueueItem(prompt="Hello", source="telegram", chat_id="12345")
+    mock_runner = MagicMock()
+    mock_runner.run = AsyncMock(return_value=ClaudeResult(text="Response", permission_denials=[]))
+    mock_runner.short_name = "gtd"
+
+    with patch("claude_telegram.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}), \
+         patch("claude_telegram.telegram.delete_message", new_callable=AsyncMock), \
+         patch("claude_telegram.main.send_response", new_callable=AsyncMock), \
+         patch("claude_telegram.main.animate_status", new_callable=AsyncMock), \
+         patch("claude_telegram.main.get_thinking_message", return_value="✨"):
+        await process_queue_item(item, mock_runner, mock_bot,
+                                 persistent_queue=pqueue, api_status=api_status)
+
+    assert api_status.unavailable is False

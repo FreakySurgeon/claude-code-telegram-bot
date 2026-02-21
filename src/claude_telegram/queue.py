@@ -183,11 +183,36 @@ class PersistentQueue:
         return self.size == 0
 
 
+class ApiStatus:
+    """Track Claude API availability (in-memory only)."""
+
+    def __init__(self):
+        self.unavailable: bool = False
+        self.since: datetime | None = None
+        self.last_error: str | None = None
+
+    def mark_unavailable(self, error: str):
+        if not self.unavailable:
+            logger.warning(f"Claude API marked unavailable: {error}")
+        self.unavailable = True
+        self.since = datetime.now()
+        self.last_error = error
+
+    def mark_available(self):
+        if self.unavailable:
+            logger.info("Claude API marked available again")
+        self.unavailable = False
+        self.since = None
+        self.last_error = None
+
+
 async def process_queue_item(
     item: QueueItem,
     runner,  # ClaudeRunner
     bot,     # BotConfig
     queue: "RequestQueue | None" = None,
+    persistent_queue: "PersistentQueue | None" = None,
+    api_status: "ApiStatus | None" = None,
 ):
     """Process a single queue item: run Claude, handle timeout/retry, send response."""
     # Lazy imports to avoid circular dependency
@@ -228,6 +253,35 @@ async def process_queue_item(
             timeout=item.timeout,
         )
 
+        # Check for quota error — persist and notify
+        if result.is_quota_error and persistent_queue and api_status:
+            was_available = not api_status.unavailable
+            api_status.mark_unavailable(result.error or "unknown quota error")
+            persistent_queue.save(item)
+            # Stop animation + delete status
+            if animation_task:
+                animation_task.cancel()
+                try: await animation_task
+                except asyncio.CancelledError: pass
+            if message_id:
+                await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
+            # First detection: prominent notification to main chat
+            if was_available:
+                await telegram.send_message(
+                    "⚠️ <b>Crédits API Claude épuisés.</b>\n"
+                    "Les messages sont automatiquement mis en file d'attente.\n"
+                    "Traitement auto dès que les crédits seront restaurés.",
+                    chat_id=bot.chat_id, parse_mode="HTML", api_url=bot.api_url,
+                )
+            # Per-message notification (only for non-silent sources)
+            if not silent:
+                await telegram.send_message(
+                    f"📥 Message en file d'attente (position {persistent_queue.size}).",
+                    chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url,
+                    message_thread_id=item.thread_id,
+                )
+            return
+
         # Stop animation + delete status
         if animation_task:
             animation_task.cancel()
@@ -235,6 +289,10 @@ async def process_queue_item(
             except asyncio.CancelledError: pass
         if message_id:
             await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
+
+        # If we got here with a successful result, clear unavailable flag
+        if api_status and api_status.unavailable:
+            api_status.mark_available()
 
         logger.info(f"Queue item completed: {item.source} (retry={item.retry_count}), response length={len(result.text)}")
 
