@@ -2,8 +2,10 @@
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
 
 logger = logging.getLogger(__name__)
@@ -147,6 +149,16 @@ async def process_queue_item(
             await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
 
         logger.info(f"Queue item completed: {item.source} (retry={item.retry_count}), response length={len(result.text)}")
+
+        # Update pending-actions status for calendar actions
+        if item.metadata.get("reminder_type") == "calendar-action":
+            action_id = item.metadata.get("action_id")
+            if action_id:
+                from .pending_actions import update_status as update_action_status
+                working_dir = getattr(bot, 'fixed_working_dir', None) or os.getcwd()
+                pending_path = Path(working_dir) / "data" / "pending-actions.json"
+                update_action_status(pending_path, action_id, "executed")
+                logger.info(f"Calendar action {action_id} marked as executed")
 
         # Send response (silent sources: no "thinking" animation, selective output)
         if silent:
