@@ -260,7 +260,7 @@ async def lifespan(app: FastAPI):
 
 async def _replay_persistent_queue(bot: BotConfig, queue: RequestQueue):
     """Replay all items from the persistent queue after API recovery."""
-    items_files = list(zip(persistent_queue.list_items(), persistent_queue.list_files()))
+    items_files = persistent_queue.list_items_with_paths()
     if not items_files:
         return
 
@@ -391,15 +391,6 @@ async def handle_message(message: dict, bot: BotConfig):
             new_session=topic_just_created,
             thread_id=thread_id,
         )
-        # Fast-path: persist directly if API unavailable
-        if api_status and api_status.unavailable and persistent_queue:
-            persistent_queue.save(item)
-            await telegram.send_message(
-                f"📥 Message en file d'attente (position {persistent_queue.size}). Claude indisponible.",
-                chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
-                message_thread_id=thread_id,
-            )
-            return
         added = await gtd_queue.enqueue(item)
         if not added:
             await telegram.send_message(
@@ -655,15 +646,6 @@ async def handle_voice(message: dict, bot: BotConfig, *, thread_id: int | None =
                     new_session=topic_just_created,
                     thread_id=thread_id,
                 )
-                # Fast-path: persist directly if API unavailable
-                if api_status and api_status.unavailable and persistent_queue:
-                    persistent_queue.save(item)
-                    await telegram.send_message(
-                        f"📥 Message vocal en file d'attente (position {persistent_queue.size}). Claude indisponible.",
-                        chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
-                        message_thread_id=thread_id,
-                    )
-                    return
                 added = await gtd_queue.enqueue(item)
                 if not added:
                     await telegram.send_message(
@@ -761,15 +743,6 @@ async def handle_photo(message: dict, bot: BotConfig, *, thread_id: int | None =
                 new_session=topic_just_created,
                 thread_id=thread_id,
             )
-            # Fast-path: persist directly if API unavailable
-            if api_status and api_status.unavailable and persistent_queue:
-                persistent_queue.save(item)
-                await telegram.send_message(
-                    f"📥 Image en file d'attente (position {persistent_queue.size}). Claude indisponible.",
-                    chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
-                    message_thread_id=thread_id,
-                )
-                return
             added = await gtd_queue.enqueue(item)
             if not added:
                 await telegram.send_message(
@@ -1819,11 +1792,6 @@ async def _process_email(data: dict, bot: BotConfig):
             metadata={"subject": subject, "from": from_addr},
             thread_id=thread_id,
         )
-        # Fast-path: persist directly if API unavailable
-        if api_status and api_status.unavailable and persistent_queue:
-            persistent_queue.save(item)
-            logger.info(f"API unavailable, persisted email to disk (queue size: {persistent_queue.size})")
-            return
         added = await gtd_queue.enqueue(item)
         if not added:
             await telegram.send_message(
@@ -2007,11 +1975,6 @@ async def _process_calendar_actions(bot: BotConfig):
                     },
                     thread_id=thread_id,
                 )
-                # Fast-path: persist directly if API unavailable
-                if api_status and api_status.unavailable and persistent_queue:
-                    persistent_queue.save(item)
-                    logger.info(f"API unavailable, persisted calendar action to disk")
-                    continue
                 added = await gtd_queue.enqueue(item)
                 if added:
                     enqueued += 1
@@ -2065,11 +2028,6 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
             metadata={"reminder_type": reminder_type},
             thread_id=thread_id,
         )
-        # Fast-path: persist directly if API unavailable
-        if api_status and api_status.unavailable and persistent_queue:
-            persistent_queue.save(item)
-            logger.info(f"API unavailable, persisted cron {reminder_type} to disk (queue size: {persistent_queue.size})")
-            return
         added = await gtd_queue.enqueue(item)
         if not added:
             logger.warning(f"Queue full, skipping cron {reminder_type}")

@@ -114,7 +114,8 @@ class PersistentQueue:
         reminder_type = item.metadata.get("reminder_type", "")
 
         # Dedup crons: remove existing file for same cron type
-        if item.source == "cron" and reminder_type:
+        # Skip dedup for calendar-action (each action is unique)
+        if item.source == "cron" and reminder_type and reminder_type != "calendar-action":
             for existing in self.queue_dir.glob(f"*-cron-{reminder_type}.json"):
                 existing.unlink()
 
@@ -145,12 +146,19 @@ class PersistentQueue:
 
     def list_items(self) -> list[QueueItem]:
         """List all queued items in FIFO order."""
+        return [item for item, _ in self.list_items_with_paths()]
+
+    def list_items_with_paths(self) -> list[tuple[QueueItem, Path]]:
+        """List all queued items with their file paths, in FIFO order.
+
+        Corrupt files are skipped (logged as warning).
+        """
         files = sorted(self.queue_dir.glob("*.json"))
-        items = []
+        result = []
         for f in files:
             try:
                 data = json.loads(f.read_text())
-                items.append(QueueItem(
+                item = QueueItem(
                     prompt=data["prompt"],
                     source=data["source"],
                     chat_id=data["chat_id"],
@@ -161,10 +169,11 @@ class PersistentQueue:
                     allowed_tools=data.get("allowed_tools"),
                     timeout=data.get("timeout", 300),
                     thread_id=data.get("thread_id"),
-                ))
+                )
+                result.append((item, f))
             except (json.JSONDecodeError, KeyError) as e:
                 logger.warning(f"Skipping corrupt queue file {f}: {e}")
-        return items
+        return result
 
     def list_files(self) -> list[Path]:
         """List all queue files in FIFO order."""

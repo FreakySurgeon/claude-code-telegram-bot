@@ -44,8 +44,9 @@ def get_project_dir(working_dir: str) -> Path | None:
         return None
 
     # Convert path to Claude's format: /Users/foo/bar -> -Users-foo-bar
+    # Claude also replaces dots with dashes
     abs_path = str(Path(working_dir).resolve())
-    claude_dir_name = abs_path.replace("/", "-")  # Keep leading dash
+    claude_dir_name = abs_path.replace("/", "-").replace(".", "-")  # Keep leading dash
 
     # Check for exact path match
     project_path = projects_dir / claude_dir_name
@@ -494,7 +495,8 @@ class ClaudeRunner:
             lower = error_message.lower()
             is_quota = any(kw in lower for kw in (
                 "quota", "billing", "rate_limit", "rate limit",
-                "overloaded", "credit", "exceeded", "limit",
+                "overloaded", "credit balance", "quota exceeded",
+                "spending limit",
             ))
 
         has_result = bool(result_text or accumulated_text)

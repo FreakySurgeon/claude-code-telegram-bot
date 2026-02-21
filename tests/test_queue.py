@@ -235,6 +235,17 @@ def test_persistent_queue_no_dedup_telegram(pqueue):
     assert pqueue.size == 2
 
 
+def test_persistent_queue_no_dedup_calendar_actions(pqueue):
+    """Test calendar-action crons are NOT deduped (each action is unique)."""
+    item1 = QueueItem(prompt="action1", source="cron", chat_id="123",
+                      metadata={"reminder_type": "calendar-action", "action_id": "a1"})
+    item2 = QueueItem(prompt="action2", source="cron", chat_id="123",
+                      metadata={"reminder_type": "calendar-action", "action_id": "a2"})
+    pqueue.save(item1)
+    pqueue.save(item2)
+    assert pqueue.size == 2
+
+
 def test_persistent_queue_creates_directory(tmp_path):
     """Test queue creates directory if it doesn't exist."""
     pq = PersistentQueue(tmp_path / "nonexistent" / "queue")
