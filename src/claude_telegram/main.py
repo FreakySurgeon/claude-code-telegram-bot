@@ -559,27 +559,8 @@ async def _resume_session(
             )
             return
 
-        # Update the source message (notification) with the topic name.
-        # The recap message sent to the topic below triggers Telegram's native
-        # "Continue to last topic" button, which reliably navigates the user.
-        topic_text = f"📂 {html.escape(name)}"
-        if source_message_id:
-            try:
-                await telegram.edit_message(
-                    source_message_id, topic_text,
-                    chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
-                )
-            except Exception as e:
-                logger.warning(f"Failed to edit source message: {e}")
-                await telegram.send_message(
-                    topic_text, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
-                )
-        else:
-            await telegram.send_message(
-                topic_text, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
-            )
-
-    # Show message recap in the topic
+    # Show message recap in the topic first (this triggers Telegram's native
+    # "Continue to last topic" button for the user to navigate)
     recap_lines = []
     for m in messages:
         text = m["text"][:200].replace("\n", " ")
@@ -596,6 +577,25 @@ async def _resume_session(
             f"📜 <b>Session resumed</b> (<code>{session_id[:8]}…</code>)\n\n{recap}",
             chat_id=chat_id, parse_mode="HTML",
             api_url=bot.api_url, message_thread_id=thread_id,
+        )
+
+    # Now update the General message (notification or new) with same style as "Claude has completed"
+    dir_name = working_dir_name(working_dir)
+    general_text = f"✅ <b>Session resumed</b> (<code>{html.escape(dir_name)}</code>)"
+    if source_message_id:
+        try:
+            await telegram.edit_message(
+                source_message_id, general_text,
+                chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to edit source message: {e}")
+            await telegram.send_message(
+                general_text, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
+            )
+    else:
+        await telegram.send_message(
+            general_text, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url,
         )
 
     # Set session_id on the runner so next message in this topic continues the session
@@ -1369,8 +1369,8 @@ async def run_claude(
         )
         return
 
-    # Check for stored session context on first interaction
-    if not runner.context_shown and not runner.is_in_conversation():
+    # Check for stored session context on first interaction (only in General, not in topics)
+    if not runner.context_shown and not runner.is_in_conversation() and not thread_id:
         context = runner.get_session_context()
         if context:
             await telegram.send_message(
