@@ -601,6 +601,7 @@ async def _resume_session(
     # Set session_id on the runner so next message in this topic continues the session
     runner = sessions.get_session(working_dir, thread_id=thread_id or 0)
     runner.session_id = session_id
+    runner.context_shown = True  # Recap already shown above, skip duplicate
 
 
 async def handle_voice(message: dict, bot: BotConfig, *, thread_id: int | None = None):
