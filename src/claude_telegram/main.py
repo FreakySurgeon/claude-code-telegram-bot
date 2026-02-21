@@ -363,6 +363,9 @@ async def handle_message(message: dict, bot: BotConfig):
     thread_id = message.get("message_thread_id")
     is_topic_message = message.get("is_topic_message", False)
 
+    text_preview = (message.get("text") or "")[:50]
+    logger.info(f"handle_message: text={text_preview!r}, thread_id={thread_id}, is_topic={is_topic_message}, bot={bot.name}")
+
     if not bot.is_authorized(chat_id):
         logger.warning(f"Unauthorized access from chat_id: {chat_id} on bot {bot.name}")
         return
@@ -386,12 +389,6 @@ async def handle_message(message: dict, bot: BotConfig):
 
     # Handle commands
     if text.startswith("/"):
-        # Navigation commands always respond in General, even if sent from a topic
-        nav_commands = {"/dir", "/dirs", "/repos", "/resume", "/rmdir", "/start", "/help"}
-        cmd = text.split()[0].lower()
-        if cmd in nav_commands:
-            thread_id = None
-            is_topic_message = False
         await handle_command(text, chat_id, bot, thread_id=thread_id, is_topic_message=is_topic_message)
         return
 
@@ -960,6 +957,8 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig, *, thread_id: 
             )
 
     elif cmd == "/dir":
+        # /dir always responds in General (Telegram auto-creates topics for all messages)
+        thread_id = None
         if args:
             session = sessions.switch_session(args)
             status = "🔄 running" if session.is_running else "💤 idle"
@@ -987,6 +986,7 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig, *, thread_id: 
             await _send_dir_browser("", chat_id, bot, thread_id)
 
     elif cmd == "/dirs":
+        thread_id = None  # Always in General
         dir_list = sessions.list_dirs()
         if not dir_list:
             await telegram.send_message(
@@ -1057,6 +1057,7 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig, *, thread_id: 
         await telegram.send_message(msg, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url, message_thread_id=thread_id)
 
     elif cmd == "/rmdir":
+        thread_id = None  # Always in General
         if args:
             if sessions.remove_session(args):
                 current = get_runner(bot, thread_id=thread_id or 0)
@@ -1087,6 +1088,7 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig, *, thread_id: 
             )
 
     elif cmd == "/repos":
+        thread_id = None  # Always in General
         favorites = settings.get_favorite_repos()
         if not favorites:
             await telegram.send_message(
