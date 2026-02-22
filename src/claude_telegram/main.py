@@ -957,8 +957,6 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig, *, thread_id: 
             )
 
     elif cmd == "/dir":
-        # /dir always responds in General (Telegram auto-creates topics for all messages)
-        thread_id = None
         if args:
             session = sessions.switch_session(args)
             status = "🔄 running" if session.is_running else "💤 idle"
@@ -986,7 +984,6 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig, *, thread_id: 
             await _send_dir_browser("", chat_id, bot, thread_id)
 
     elif cmd == "/dirs":
-        thread_id = None  # Always in General
         dir_list = sessions.list_dirs()
         if not dir_list:
             await telegram.send_message(
@@ -1057,7 +1054,6 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig, *, thread_id: 
         await telegram.send_message(msg, chat_id=chat_id, parse_mode="HTML", api_url=bot.api_url, message_thread_id=thread_id)
 
     elif cmd == "/rmdir":
-        thread_id = None  # Always in General
         if args:
             if sessions.remove_session(args):
                 current = get_runner(bot, thread_id=thread_id or 0)
@@ -1088,7 +1084,6 @@ async def handle_command(text: str, chat_id: str, bot: BotConfig, *, thread_id: 
             )
 
     elif cmd == "/repos":
-        thread_id = None  # Always in General
         favorites = settings.get_favorite_repos()
         if not favorites:
             await telegram.send_message(
