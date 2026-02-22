@@ -44,9 +44,9 @@ def get_project_dir(working_dir: str) -> Path | None:
         return None
 
     # Convert path to Claude's format: /Users/foo/bar -> -Users-foo-bar
-    # Claude also replaces dots with dashes
+    # Claude replaces / . and _ with dashes
     abs_path = str(Path(working_dir).resolve())
-    claude_dir_name = abs_path.replace("/", "-").replace(".", "-")  # Keep leading dash
+    claude_dir_name = abs_path.replace("/", "-").replace(".", "-").replace("_", "-")
 
     # Check for exact path match
     project_path = projects_dir / claude_dir_name
@@ -54,7 +54,7 @@ def get_project_dir(working_dir: str) -> Path | None:
         return project_path
 
     # Fallback: look for any project dir that might match
-    dir_name = working_dir.split("/")[-1]
+    dir_name = working_dir.split("/")[-1].replace(".", "-").replace("_", "-")
     for project_path in projects_dir.iterdir():
         if project_path.is_dir() and project_path.name.endswith(f"-{dir_name}"):
             return project_path
@@ -96,6 +96,11 @@ def delete_session(session_id: str, working_dir: str) -> bool:
     return False
 
 
+def _dir_to_claude_name(path: str) -> str:
+    """Convert a filesystem path to Claude's project directory name format."""
+    return str(Path(path).resolve()).replace("/", "-").replace(".", "-").replace("_", "-")
+
+
 def find_session_working_dir(session_id: str) -> str | None:
     """Find the working directory for a session by scanning all project directories.
 
@@ -112,15 +117,25 @@ def find_session_working_dir(session_id: str) -> str | None:
         session_file = project_dir / f"{session_id}.jsonl"
         if session_file.exists():
             # Reconstruct working_dir from project dir name
-            # e.g. -home-thomas-projects-personal-org -> /home/thomas/projects/personal-org
-            # The dir name has leading dash and dashes replacing / (and .)
-            # We can't perfectly reverse dot-vs-dash, but we can check if the path exists
+            # The name has dashes replacing / . and _, so it's ambiguous to reverse.
+            # Strategy: try naive replacement, then check common parent dirs.
             dir_name = project_dir.name.lstrip("-")
             candidate = "/" + dir_name.replace("-", "/")
             if Path(candidate).is_dir():
                 return candidate
-            # Fallback: try to find an existing path by testing segments
-            # This handles cases where original path had dashes in folder names
+            # Try parent dirs that exist and check children with underscores/dots
+            # e.g. -home-thomas-media-server-docker -> /home/thomas/media_server_docker
+            parts = dir_name.split("-")
+            for i in range(len(parts) - 1, 0, -1):
+                parent = "/" + "/".join(parts[:i])
+                if Path(parent).is_dir():
+                    # Check children — try combining remaining parts with _ and .
+                    remaining = "-".join(parts[i:])
+                    for child in Path(parent).iterdir():
+                        if child.is_dir() and _dir_to_claude_name(str(child)).lstrip("-") == dir_name:
+                            return str(child)
+                    break
+            # Last resort: return the naive candidate
             return candidate
     return None
 
