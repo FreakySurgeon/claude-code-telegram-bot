@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -43,10 +44,10 @@ def get_project_dir(working_dir: str) -> Path | None:
     if not projects_dir.exists():
         return None
 
-    # Convert path to Claude's format: /Users/foo/bar -> -Users-foo-bar
-    # Claude replaces / . and _ with dashes
+    # Convert path to Claude's format: any non-alphanumeric char becomes a dash
+    # e.g. /home/thomas/media_server_docker -> -home-thomas-media-server-docker
     abs_path = str(Path(working_dir).resolve())
-    claude_dir_name = abs_path.replace("/", "-").replace(".", "-").replace("_", "-")
+    claude_dir_name = re.sub(r'[^a-zA-Z0-9]', '-', abs_path)
 
     # Check for exact path match
     project_path = projects_dir / claude_dir_name
@@ -54,7 +55,7 @@ def get_project_dir(working_dir: str) -> Path | None:
         return project_path
 
     # Fallback: look for any project dir that might match
-    dir_name = working_dir.split("/")[-1].replace(".", "-").replace("_", "-")
+    dir_name = re.sub(r'[^a-zA-Z0-9]', '-', working_dir.split("/")[-1])
     for project_path in projects_dir.iterdir():
         if project_path.is_dir() and project_path.name.endswith(f"-{dir_name}"):
             return project_path
@@ -98,7 +99,7 @@ def delete_session(session_id: str, working_dir: str) -> bool:
 
 def _dir_to_claude_name(path: str) -> str:
     """Convert a filesystem path to Claude's project directory name format."""
-    return str(Path(path).resolve()).replace("/", "-").replace(".", "-").replace("_", "-")
+    return re.sub(r'[^a-zA-Z0-9]', '-', str(Path(path).resolve()))
 
 
 def find_session_working_dir(session_id: str) -> str | None:
