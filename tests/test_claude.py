@@ -542,4 +542,30 @@ async def test_execute_error_not_flagged_when_result_present():
     result = await runner._execute()
     assert result.text == "Here is the response"
     assert result.error is None  # Not flagged because we got a result
-    assert result.is_quota_error is False
+    assert result.is_quota_error is False  # returncode=0, so it's just a warning
+
+
+@pytest.mark.asyncio
+async def test_execute_quota_error_in_response_text():
+    """Test that quota error is detected when CLI outputs it as assistant text with non-zero exit."""
+    runner = ClaudeRunner.__new__(ClaudeRunner)
+    runner.working_dir = "/tmp/test"
+    runner.session_id = None
+    runner.last_interaction = None
+
+    # Claude CLI outputs the quota error as regular assistant text (not as error event)
+    assistant_event = json.dumps({
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": "You've hit your limit. Resets at 11pm."}]},
+    })
+
+    proc = AsyncMock()
+    proc.stdout = AsyncIterator([assistant_event.encode()])
+    proc.wait = AsyncMock(return_value=1)
+    proc.returncode = 1
+    runner.current_process = proc
+
+    result = await runner._execute()
+    assert result.is_quota_error is True
+    # text contains the quota message (used for notification)
+    assert "hit your limit" in result.text.lower()

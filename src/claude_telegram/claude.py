@@ -519,22 +519,37 @@ class ClaudeRunner:
             logger.info(f"Session ID for {self.short_name}: {run_session_id}")
 
         # Detect quota-related errors
+        quota_keywords = (
+            "quota", "billing", "rate_limit", "rate limit",
+            "overloaded", "credit balance", "quota exceeded",
+            "spending limit", "hit your limit", "usage limit",
+        )
         is_quota = False
         if error_message:
             lower = error_message.lower()
-            is_quota = any(kw in lower for kw in (
-                "quota", "billing", "rate_limit", "rate limit",
-                "overloaded", "credit balance", "quota exceeded",
-                "spending limit",
-            ))
+            is_quota = any(kw in lower for kw in quota_keywords)
 
-        has_result = bool(result_text or accumulated_text)
+        # Claude CLI sometimes emits quota errors as regular assistant text
+        # (not as error events), so also check the response text when
+        # the process exited with a non-zero code.
+        response_text = result_text or accumulated_text
+        if not is_quota and returncode and returncode != 0 and response_text:
+            lower_resp = response_text.lower()
+            is_quota = any(kw in lower_resp for kw in quota_keywords)
+            if is_quota:
+                error_message = response_text
+                logger.warning(f"Quota error detected in response text: {response_text[:100]}")
+
+        has_result = bool(response_text)
+        # is_quota_error only when the request actually failed:
+        # either no result, or process exited with error code
+        failed = not has_result or (returncode is not None and returncode != 0)
         return ClaudeResult(
-            text=result_text or accumulated_text,
+            text=response_text,
             permission_denials=permission_denials,
             session_id=run_session_id,
             error=error_message if not has_result else None,
-            is_quota_error=is_quota and not has_result,
+            is_quota_error=is_quota and failed,
         )
 
     async def _force_kill(self):
