@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     # Email webhook
     webhook_secret: str | None = None
 
+    # Trello API (for direct card creation — alerts, enrichment)
+    trello_api_key: str = ""
+    trello_token: str = ""
+    trello_todo_list_id: str = ""
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     def get_favorite_repos(self) -> list[str]:
