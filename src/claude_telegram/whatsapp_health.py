@@ -13,7 +13,7 @@ from .config import settings
 logger = logging.getLogger(__name__)
 
 BRIDGE_HOST = "127.0.0.1"
-BRIDGE_PORT = 8080
+BRIDGE_PORT = 8082
 TCP_TIMEOUT = 3  # seconds
 RESTART_WAIT = 5  # seconds after systemctl restart
 
