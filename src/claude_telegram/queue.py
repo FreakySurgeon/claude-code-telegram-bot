@@ -27,6 +27,7 @@ class QueueItem:
     chat_id: str
     # Optional metadata
     metadata: dict = field(default_factory=dict)
+    model: str | None = None
     continue_session: bool = False
     bypass_permissions: bool = True
     new_session: bool = False
@@ -48,6 +49,7 @@ class QueueItem:
             source=self.source,
             chat_id=self.chat_id,
             metadata=self.metadata,
+            model=self.model,
             continue_session=False,
             bypass_permissions=self.bypass_permissions,
             new_session=True,
@@ -251,8 +253,11 @@ async def process_queue_item(
             )
 
     try:
+        logger.info(f"Processing queue item: source={item.source}, model={item.model or 'default'}, "
+                     f"timeout={item.timeout}s, metadata={item.metadata}")
         result = await runner.run(
             item.prompt,
+            model=item.model,
             continue_session=item.continue_session,
             new_session=item.new_session,
             allowed_tools=item.allowed_tools,
@@ -340,6 +345,43 @@ async def process_queue_item(
         else:
             await telegram.send_message("<i>(pas de réponse)</i>", chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url, message_thread_id=item.thread_id)
 
+        # --- Escalation detection ---
+        # Agent can request a more powerful model via HTML markers
+        response_text = result.text or ""
+        if not item.metadata.get("escalated") and queue:
+            escalate_to = None
+            if "<!-- escalate:opus -->" in response_text:
+                escalate_to = "opus"
+            elif "<!-- escalate:sonnet -->" in response_text:
+                escalate_to = "sonnet"
+
+            if escalate_to:
+                logger.info(f"Escalation requested: {item.model or 'default'} → {escalate_to} (source={item.source})")
+                # Build escalation context from previous agent's response
+                summary = response_text.replace("<!-- escalate:sonnet -->", "").replace("<!-- escalate:opus -->", "").strip()
+                if len(summary) > 2000:
+                    summary = summary[:2000] + "\n[...tronqué]"
+
+                escalated_item = QueueItem(
+                    prompt=(
+                        f"[ESCALADE depuis {item.model or 'sonnet'}]\n"
+                        f"L'agent précédent a demandé l'escalade. Voici son résumé :\n\n"
+                        f"{summary}\n\n"
+                        f"---\n\n"
+                        f"{item.prompt}"
+                    ),
+                    source=item.source,
+                    chat_id=item.chat_id,
+                    model=escalate_to,
+                    metadata={**item.metadata, "escalated": True},
+                    new_session=True,
+                    bypass_permissions=item.bypass_permissions,
+                    timeout=item.timeout,
+                    thread_id=item.thread_id,
+                )
+                await queue.enqueue(escalated_item)
+                logger.info(f"Escalated item queued ({escalate_to})")
+
         # --- Post-session memory enrichment (loaded from external file) ---
         if item.source == "telegram" and result.text and len(result.text) > 100:
             from .main import _load_post_session_prompt
@@ -348,6 +390,7 @@ async def process_queue_item(
                 try:
                     await runner.run(
                         post_prompt,
+                        model="haiku",
                         continue_session=True,
                         bypass_permissions=True,
                         system_prompt=getattr(bot, 'system_prompt', None),

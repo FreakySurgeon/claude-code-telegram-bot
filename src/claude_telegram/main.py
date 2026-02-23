@@ -34,6 +34,16 @@ SPINNER_VERBS = [
     "Wandering", "Whirring", "Wibbling", "Wizarding", "Working", "Wrangling",
 ]
 
+# Model assignment per cron type — lightweight crons use Haiku
+CRON_MODELS: dict[str, str | None] = {
+    "whatsapp": "haiku",
+    "gdrive-inbox": "haiku",
+    "morning": None,          # default (Sonnet)
+    "evening": None,          # default (Sonnet)
+    "weekly": None,           # default (Sonnet)
+    "calendar-actions": None, # default (Sonnet)
+}
+
 def _load_cron_prompt(reminder_type: str) -> str | None:
     """Load a cron prompt from the configured directory, or return None."""
     from .config import settings
@@ -1838,8 +1848,9 @@ async def _process_email(data: dict, bot: BotConfig):
             prompt=prompt,
             source="email",
             chat_id=bot.chat_id,
+            model="haiku",
             new_session=True,
-            timeout=600,  # 10 min for email (MCP-heavy: Gmail + Trello + GDrive)
+            timeout=900,  # 15 min for email (MCP-heavy: Gmail + Trello + GDrive)
             metadata={"subject": subject, "from": from_addr},
             thread_id=thread_id,
         )
@@ -1856,6 +1867,7 @@ async def _process_email(data: dict, bot: BotConfig):
             runner = get_runner(bot, thread_id=thread_id or 0)
             result = await runner.run(
                 prompt,
+                model="haiku",
                 new_session=True,
                 bypass_permissions=True,
                 system_prompt=bot.system_prompt,
@@ -2019,7 +2031,7 @@ async def _process_calendar_actions(bot: BotConfig):
                     source="cron",
                     chat_id=bot.chat_id,
                     new_session=True,
-                    timeout=600,
+                    timeout=900,  # 15 min for calendar actions
                     metadata={
                         "reminder_type": "calendar-action",
                         "action_id": action_id,
@@ -2081,8 +2093,9 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
             prompt=prompt,
             source="cron",
             chat_id=bot.chat_id,
+            model=CRON_MODELS.get(reminder_type),
             new_session=True,
-            timeout=600,  # 10 min for cron (MCP-heavy: Trello + Calendar)
+            timeout=1800,  # 30 min for cron (enrichissement Trello par subagents)
             metadata={"reminder_type": reminder_type},
             thread_id=thread_id,
         )
@@ -2095,6 +2108,7 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
             runner = get_runner(bot, thread_id=thread_id or 0)
             result = await runner.run(
                 prompt,
+                model=CRON_MODELS.get(reminder_type),
                 new_session=True,
                 bypass_permissions=True,
                 system_prompt=bot.system_prompt,

@@ -353,6 +353,7 @@ class ClaudeRunner:
         self,
         message: str,
         *,
+        model: str | None = None,
         continue_session: bool = False,
         new_session: bool = False,
         on_output: callable = None,
@@ -367,6 +368,7 @@ class ClaudeRunner:
 
         Args:
             message: The prompt to send to Claude
+            model: Optional model to use (e.g., "opus", "sonnet")
             continue_session: If True, resume the session
             new_session: If True, force a new session (ignore stored session_id)
             on_output: Optional callback for streaming output
@@ -380,6 +382,10 @@ class ClaudeRunner:
             ClaudeResult with response text and any permission denials
         """
         cmd = [self.cli_path, "--print", "--output-format", "stream-json", "--verbose"]
+
+        # Select model if specified
+        if model:
+            cmd.extend(["--model", model])
 
         # Add bypass permissions if specified
         if bypass_permissions:
@@ -418,7 +424,7 @@ class ClaudeRunner:
         # Prompt is a positional argument, not a flag
         cmd.append(message)
 
-        logger.info(f"Running: {' '.join(cmd)} in {self.working_dir or 'cwd'}")
+        logger.info(f"Running: {' '.join(cmd)} in {self.working_dir or 'cwd'} (model={model or 'default'})")
 
         cwd = Path(self.working_dir) if self.working_dir else None
 
