@@ -86,6 +86,7 @@ from .pending_actions import (
     cleanup_actions,
     is_duplicate,
 )
+from .whatsapp_health import ensure_whatsapp_bridge
 
 # Store pending permission requests for retry
 pending_permissions: dict[str, dict] = {}  # chat_id -> {message, denials, session_key, bot_name}
@@ -2059,6 +2060,13 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
     # Silent crons don't create topics
     silent = reminder_type in ("whatsapp", "gdrive-inbox")
     thread_id = None
+
+    # WhatsApp bridge pre-flight check
+    if reminder_type == "whatsapp":
+        bridge_ok = await ensure_whatsapp_bridge(bot.chat_id, bot.api_url)
+        if not bridge_ok:
+            logger.warning("WhatsApp bridge down, skipping scan")
+            return
 
     if not silent:
         name = generate_provisional_name(f"Cron: {reminder_type}", is_agent=True)
