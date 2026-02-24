@@ -44,7 +44,11 @@ def make_stream_json(result_text: str, permission_denials: list = None):
             "type": "result",
             "result": result_text,
             "session_id": "test-session",
-            "permission_denials": permission_denials or []
+            "permission_denials": permission_denials or [],
+            "cost_usd": 0.01,
+            "num_turns": 1,
+            "duration_api_ms": 500,
+            "usage": {"input_tokens": 100, "output_tokens": 50},
         }).encode() + b"\n",
     ]
     return events
@@ -110,7 +114,11 @@ async def test_run_with_callback(runner, mock_process):
             "type": "result",
             "result": "Line 1\nLine 2",
             "session_id": "test",
-            "permission_denials": []
+            "permission_denials": [],
+            "cost_usd": 0.01,
+            "num_turns": 1,
+            "duration_api_ms": 500,
+            "usage": {"input_tokens": 100, "output_tokens": 50},
         }).encode() + b"\n",
     ]
     mock_process.stdout = async_iter(events)
@@ -443,6 +451,28 @@ def test_claude_result_defaults_no_error():
     result = ClaudeResult(text="hello")
     assert result.error is None
     assert result.is_quota_error is False
+    assert result.cost_usd is None
+    assert result.input_tokens == 0
+    assert result.output_tokens == 0
+    assert result.num_turns == 0
+    assert result.duration_api_ms == 0
+
+
+def test_claude_result_metrics_fields():
+    """Test ClaudeResult stores metrics correctly."""
+    result = ClaudeResult(
+        text="hello",
+        cost_usd=0.05,
+        input_tokens=200,
+        output_tokens=100,
+        num_turns=3,
+        duration_api_ms=1500,
+    )
+    assert result.cost_usd == 0.05
+    assert result.input_tokens == 200
+    assert result.output_tokens == 100
+    assert result.num_turns == 3
+    assert result.duration_api_ms == 1500
 
 
 class AsyncIterator:
@@ -519,6 +549,69 @@ async def test_execute_no_error_on_success():
     assert result.text == "Hello!"
     assert result.error is None
     assert result.is_quota_error is False
+
+
+@pytest.mark.asyncio
+async def test_execute_extracts_metrics():
+    """Test that _execute extracts token usage and cost metrics from result event."""
+    runner = ClaudeRunner.__new__(ClaudeRunner)
+    runner.working_dir = "/tmp/test"
+    runner.session_id = None
+    runner.last_interaction = None
+
+    result_event = json.dumps({
+        "type": "result",
+        "result": "Done!",
+        "session_id": "abc123",
+        "cost_usd": 0.042,
+        "num_turns": 5,
+        "duration_api_ms": 2500,
+        "usage": {"input_tokens": 1200, "output_tokens": 800},
+    })
+
+    proc = AsyncMock()
+    proc.stdout = AsyncIterator([result_event.encode()])
+    proc.wait = AsyncMock(return_value=0)
+    proc.returncode = 0
+    runner.current_process = proc
+
+    result = await runner._execute()
+    assert result.text == "Done!"
+    assert result.cost_usd == 0.042
+    assert result.input_tokens == 1200
+    assert result.output_tokens == 800
+    assert result.num_turns == 5
+    assert result.duration_api_ms == 2500
+
+
+@pytest.mark.asyncio
+async def test_execute_metrics_default_when_missing():
+    """Test that metrics default to zero/None when not present in result event."""
+    runner = ClaudeRunner.__new__(ClaudeRunner)
+    runner.working_dir = "/tmp/test"
+    runner.session_id = None
+    runner.last_interaction = None
+
+    # Result event with no metrics fields
+    result_event = json.dumps({
+        "type": "result",
+        "result": "Hello!",
+        "session_id": "abc123",
+    })
+
+    proc = AsyncMock()
+    proc.stdout = AsyncIterator([result_event.encode()])
+    proc.wait = AsyncMock(return_value=0)
+    proc.returncode = 0
+    runner.current_process = proc
+
+    result = await runner._execute()
+    assert result.text == "Hello!"
+    assert result.cost_usd is None
+    assert result.input_tokens == 0
+    assert result.output_tokens == 0
+    assert result.num_turns == 0
+    assert result.duration_api_ms == 0
 
 
 @pytest.mark.asyncio

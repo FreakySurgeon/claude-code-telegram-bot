@@ -29,6 +29,12 @@ class ClaudeResult:
     session_id: str | None = None
     error: str | None = None
     is_quota_error: bool = False
+    # Metrics (extracted from stream-json result event)
+    cost_usd: float | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    num_turns: int = 0
+    duration_api_ms: int = 0
 
 logger = logging.getLogger(__name__)
 
@@ -468,6 +474,11 @@ class ClaudeRunner:
         permission_denials = []
         result_session_id = None
         error_message = None
+        result_cost_usd = None
+        result_num_turns = 0
+        result_duration_api_ms = 0
+        result_input_tokens = 0
+        result_output_tokens = 0
 
         async for line in self.current_process.stdout:
             decoded = line.decode("utf-8", errors="replace").strip()
@@ -482,6 +493,13 @@ class ClaudeRunner:
                 if event_type == "result":
                     result_text = event.get("result", "")
                     result_session_id = event.get("session_id")
+                    # Extract metrics from result event
+                    result_cost_usd = event.get("cost_usd")
+                    result_num_turns = event.get("num_turns", 0)
+                    result_duration_api_ms = event.get("duration_api_ms", 0)
+                    usage = event.get("usage") or {}
+                    result_input_tokens = usage.get("input_tokens", 0)
+                    result_output_tokens = usage.get("output_tokens", 0)
                     # Parse permission denials
                     for denial in event.get("permission_denials", []):
                         permission_denials.append(PermissionDenial(
@@ -572,6 +590,11 @@ class ClaudeRunner:
             session_id=run_session_id,
             error=error_message if not has_result else None,
             is_quota_error=is_quota and failed,
+            cost_usd=result_cost_usd,
+            input_tokens=result_input_tokens,
+            output_tokens=result_output_tokens,
+            num_turns=result_num_turns,
+            duration_api_ms=result_duration_api_ms,
         )
 
     async def _force_kill(self):
