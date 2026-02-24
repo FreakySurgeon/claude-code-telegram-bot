@@ -13,7 +13,7 @@ from typing import Literal
 logger = logging.getLogger(__name__)
 
 RETRY_PREFIX = (
-    "[RETRY] La requête précédente a été interrompue après 5 minutes "
+    "[RETRY] La requête précédente a été interrompue après 10 minutes "
     "(probablement un appel MCP bloqué). Adapte ta stratégie : "
     "évite les recherches longues, limite les appels MCP, va à l'essentiel.\n\n---\n\n"
 )
@@ -169,7 +169,7 @@ class PersistentQueue:
                     bypass_permissions=data.get("bypass_permissions", True),
                     new_session=data.get("new_session", True),
                     allowed_tools=data.get("allowed_tools"),
-                    timeout=data.get("timeout", 300),
+                    timeout=data.get("timeout", 600),
                     thread_id=data.get("thread_id"),
                 )
                 result.append((item, f))
