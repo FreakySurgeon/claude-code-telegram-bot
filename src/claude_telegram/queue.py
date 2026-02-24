@@ -32,7 +32,7 @@ class QueueItem:
     bypass_permissions: bool = True
     new_session: bool = False
     allowed_tools: list[str] | None = None
-    timeout: float = 300  # seconds (5 min default, override for email/cron)
+    timeout: float = 600  # seconds (10 min default, override for email/cron)
     # Retry state
     retry_count: int = 0
     original_error: str | None = None
