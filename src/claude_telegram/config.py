@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     trello_token: str = ""
     trello_todo_list_id: str = ""
 
+    # Metrics
+    cron_token_alert_threshold: int = 100_000  # Alert if cron uses more tokens
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     def get_favorite_repos(self) -> list[str]:

@@ -255,6 +255,7 @@ async def process_queue_item(
     try:
         logger.info(f"Processing queue item: source={item.source}, model={item.model or 'default'}, "
                      f"timeout={item.timeout}s, metadata={item.metadata}")
+        _run_start = time.monotonic()
         result = await runner.run(
             item.prompt,
             model=item.model,
@@ -309,6 +310,45 @@ async def process_queue_item(
             api_status.mark_available()
 
         logger.info(f"Queue item completed: {item.source} (retry={item.retry_count}), response length={len(result.text)}")
+
+        _run_duration = time.monotonic() - _run_start
+
+        # --- Structured metrics logging ---
+        from .metrics import write_metric
+        from .config import settings
+        reminder_type = item.metadata.get("reminder_type", "")
+        _run_type = reminder_type or item.source
+        write_metric(
+            source=item.source,
+            run_type=_run_type,
+            model=item.model,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cost_usd=result.cost_usd,
+            num_turns=result.num_turns,
+            duration_s=_run_duration,
+            duration_api_ms=result.duration_api_ms,
+            status="ok",
+            session_id=result.session_id,
+        )
+
+        # --- Token alert for crons ---
+        if item.source == "cron" and settings.cron_token_alert_threshold:
+            total_tokens = result.input_tokens + result.output_tokens
+            if total_tokens > settings.cron_token_alert_threshold:
+                alert_msg = (
+                    f"\u26a0\ufe0f Cron <b>{_run_type}</b> a consomm\u00e9 "
+                    f"<b>{total_tokens // 1000}k tokens</b> "
+                    f"(seuil : {settings.cron_token_alert_threshold // 1000}k)"
+                )
+                if result.cost_usd:
+                    alert_msg += f"\n\U0001f4b0 Co\u00fbt : ${result.cost_usd:.2f}"
+                await telegram.send_message(
+                    alert_msg,
+                    chat_id=bot.chat_id,
+                    parse_mode="HTML",
+                    api_url=bot.api_url,
+                )
 
         # Update pending-actions status for calendar actions
         if item.metadata.get("reminder_type") == "calendar-action":
@@ -408,6 +448,17 @@ async def process_queue_item(
 
     except TimeoutError as e:
         logger.warning(f"Queue item timed out: {item.source} (retry={item.retry_count}, timeout={item.timeout}s)")
+        _run_duration = time.monotonic() - _run_start
+        from .metrics import write_metric
+        reminder_type = item.metadata.get("reminder_type", "")
+        write_metric(
+            source=item.source,
+            run_type=reminder_type or item.source,
+            model=item.model,
+            input_tokens=0, output_tokens=0, cost_usd=None,
+            num_turns=0, duration_s=_run_duration, duration_api_ms=0,
+            status="timeout", session_id=None,
+        )
         # Stop animation
         if animation_task:
             animation_task.cancel()
@@ -435,6 +486,17 @@ async def process_queue_item(
                 )
 
     except Exception as e:
+        _run_duration = time.monotonic() - _run_start
+        from .metrics import write_metric
+        reminder_type = item.metadata.get("reminder_type", "")
+        write_metric(
+            source=item.source,
+            run_type=reminder_type or item.source,
+            model=item.model,
+            input_tokens=0, output_tokens=0, cost_usd=None,
+            num_turns=0, duration_s=_run_duration, duration_api_ms=0,
+            status="error", session_id=None,
+        )
         if animation_task:
             animation_task.cancel()
             try: await animation_task
