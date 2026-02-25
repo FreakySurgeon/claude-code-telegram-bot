@@ -9,6 +9,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load .env into os.environ so Claude CLI subprocesses inherit all vars
+# (needed for MCP servers that use ${ENV_VAR} references in .mcp.json)
+load_dotenv()
+
 from fastapi import FastAPI, Request
 
 from .bots import BotConfig, create_bots
