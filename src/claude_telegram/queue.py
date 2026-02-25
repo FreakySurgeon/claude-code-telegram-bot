@@ -18,6 +18,37 @@ RETRY_PREFIX = (
     "évite les recherches longues, limite les appels MCP, va à l'essentiel.\n\n---\n\n"
 )
 
+DEAD_LETTER_MAX = 50
+
+
+def _write_dead_letter(item: "QueueItem", error: str) -> None:
+    """Persist failed items to dead-letter.json for later review."""
+    try:
+        working_dir = os.environ.get("GTD_WORKING_DIR", "")
+        if not working_dir:
+            logger.warning("GTD_WORKING_DIR not set, skipping dead-letter write")
+            return
+        dl_path = Path(working_dir) / "data" / "dead-letter.json"
+        entries: list[dict] = []
+        if dl_path.exists():
+            try:
+                entries = json.loads(dl_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                entries = []
+        entries.append({
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "source": item.source,
+            "type": item.metadata.get("reminder_type", item.source),
+            "prompt_preview": item.prompt[:200],
+            "error": str(error),
+            "model": item.model or "default",
+        })
+        if len(entries) > DEAD_LETTER_MAX:
+            entries = entries[-DEAD_LETTER_MAX:]
+        dl_path.write_text(json.dumps(entries, indent=2, ensure_ascii=False))
+    except Exception:
+        logger.warning("Failed to write dead-letter entry", exc_info=True)
+
 
 @dataclass
 class QueueItem:
@@ -478,6 +509,7 @@ async def process_queue_item(
                     message_thread_id=item.thread_id,
                 )
         else:
+            _write_dead_letter(item, f"TimeoutError after {item.retry_count + 1} attempts ({item.timeout}s)")
             if not silent:
                 await telegram.send_message(
                     "❌ Échec après 2 tentatives (timeout). Requête abandonnée.",
@@ -504,6 +536,7 @@ async def process_queue_item(
         if message_id:
             await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
 
+        _write_dead_letter(item, str(e))
         logger.exception("Queue item processing error")
         if not silent:
             await telegram.send_message(
