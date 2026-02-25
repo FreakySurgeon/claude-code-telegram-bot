@@ -425,11 +425,13 @@ async def process_queue_item(
                 escalate_to = "opus"
             elif "<!-- escalate:sonnet -->" in response_text:
                 escalate_to = "sonnet"
+            elif "<!-- escalate:haiku -->" in response_text:
+                escalate_to = "haiku"
 
             if escalate_to:
                 logger.info(f"Escalation requested: {item.model or 'default'} → {escalate_to} (source={item.source})")
                 # Build escalation context from previous agent's response
-                summary = response_text.replace("<!-- escalate:sonnet -->", "").replace("<!-- escalate:opus -->", "").strip()
+                summary = response_text.replace("<!-- escalate:sonnet -->", "").replace("<!-- escalate:opus -->", "").replace("<!-- escalate:haiku -->", "").strip()
                 if len(summary) > 2000:
                     summary = summary[:2000] + "\n[...tronqué]"
 
