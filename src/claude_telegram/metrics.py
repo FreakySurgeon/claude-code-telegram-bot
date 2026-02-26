@@ -45,3 +45,27 @@ def write_metric(
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
         logger.warning("Failed to write metric", exc_info=True)
+
+
+def write_feedback(
+    *,
+    feedback: str,
+    chat_id: str,
+    thread_id: int | None,
+    message_id: int,
+) -> None:
+    """Log a feedback event (thumbs up/down) to the metrics file."""
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "source": "feedback",
+        "type": feedback,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "message_id": message_id,
+    }
+    try:
+        METRICS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with METRICS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.warning("Failed to write feedback metric", exc_info=True)

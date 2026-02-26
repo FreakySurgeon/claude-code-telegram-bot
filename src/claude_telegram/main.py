@@ -2,6 +2,7 @@
 
 import asyncio
 import html
+import json
 import logging
 import random
 import re
@@ -817,13 +818,21 @@ async def handle_photo(message: dict, bot: BotConfig, *, thread_id: int | None =
 
 
 def is_quick_reply(text: str) -> bool:
-    """Check if the message is a quick reply (number, yes/no, etc.)."""
+    """Check if the message is a quick reply (number, yes/no, button label, etc.)."""
     text = text.strip().lower()
     # Single number
     if re.match(r"^\d+$", text):
         return True
-    # Common quick replies
-    if text in ("yes", "no", "y", "n", "ok", "cancel", "skip", "done", "next"):
+    # Common quick replies (EN + FR + emoji from buttons)
+    quick_words = {
+        "yes", "no", "y", "n", "ok", "cancel", "skip", "done", "next",
+        "oui", "non", "confirmer", "annuler", "continuer", "reporter",
+        "abandonner", "modifier", "✅", "❌",
+        "c'est bon", "tout est ok", "rien de spécial, on continue",
+        "j'ai des retours", "je veux modifier", "j'ai un feedback",
+        "lancer la review",
+    }
+    if text in quick_words:
         return True
     return False
 
@@ -1181,7 +1190,37 @@ async def handle_callback(callback: dict, bot: BotConfig):
             pass
         return
 
-    if data.startswith("reply:"):
+    if data.startswith("feedback:"):
+        # Feedback buttons — log and acknowledge, don't trigger Claude
+        feedback_type = data.split(":", 1)[1]  # "up" or "down"
+        from .metrics import write_feedback
+        msg_id = callback["message"]["message_id"]
+        write_feedback(
+            feedback=feedback_type,
+            chat_id=str(chat_id),
+            thread_id=callback["message"].get("message_thread_id"),
+            message_id=msg_id,
+        )
+        emoji = "👍" if feedback_type == "up" else "👎"
+        try:
+            await telegram.answer_callback(query_id, text=emoji, api_url=bot.api_url)
+        except Exception:
+            pass
+        # Remove feedback buttons after click
+        try:
+            await telegram.edit_message(
+                msg_id,
+                callback["message"].get("text", ""),
+                chat_id=str(chat_id),
+                parse_mode=None,
+                api_url=bot.api_url,
+                reply_markup={"inline_keyboard": []},
+            )
+        except Exception:
+            pass  # May fail if message has entities — not critical
+        return
+
+    elif data.startswith("reply:"):
         reply = data[6:]  # Remove "reply:" prefix
         callback_thread_id = callback["message"].get("message_thread_id", 0)
         await run_claude(reply, str(chat_id), bot, continue_session=True, thread_id=callback_thread_id)
@@ -1605,8 +1644,8 @@ async def send_permission_request(
         )
 
 
-async def send_response(text: str, chat_id: str, chunk_size: int = 4000, session_name: str = "default", api_url: str | None = None, message_thread_id: int | None = None):
-    """Send Claude's response, with quick-reply buttons if numbered options detected."""
+async def send_response(text: str, chat_id: str, chunk_size: int = 4000, session_name: str = "default", api_url: str | None = None, message_thread_id: int | None = None, skip_buttons: bool = False):
+    """Send Claude's response with smart button detection."""
     if not text.strip():
         await telegram.send_message(
             "<i>(no output)</i>",
@@ -1617,11 +1656,15 @@ async def send_response(text: str, chat_id: str, chunk_size: int = 4000, session
         )
         return
 
-    # Detect numbered options before converting to HTML
-    buttons = detect_options(text)
+    # Extract buttons from raw text (before markdown conversion)
+    if skip_buttons:
+        cleaned_text = text
+        buttons = None
+    else:
+        cleaned_text, buttons, _button_type = extract_buttons_from_response(text)
 
     # Convert markdown to Telegram HTML
-    html_text = markdown_to_telegram_html(text)
+    html_text = markdown_to_telegram_html(cleaned_text)
 
     # Split into chunks if needed
     chunks = split_text(html_text, chunk_size)
@@ -1653,24 +1696,65 @@ async def send_response(text: str, chat_id: str, chunk_size: int = 4000, session
             await asyncio.sleep(0.5)
 
 
-def detect_options(text: str) -> dict | None:
-    """Detect numbered options (1. Option, 2. Option) and create inline keyboard."""
-    # Look for patterns like "1.", "2.", "3." at start of lines
-    pattern = r"^(\d+)[\.\)]\s+"
-    matches = re.findall(pattern, text, re.MULTILINE)
+BUTTON_MARKER_RE = re.compile(r'<!--\s*buttons:\s*(.+?)\s*-->')
 
-    if not matches or len(matches) < 2:
-        return None
 
-    # Get unique numbers, max 8 buttons
-    numbers = sorted(set(matches))[:8]
+def _build_feedback_buttons() -> dict:
+    """Build the default 👍/👎 feedback buttons."""
+    return {"inline_keyboard": [[
+        {"text": "👍", "callback_data": "feedback:up"},
+        {"text": "👎", "callback_data": "feedback:down"},
+    ]]}
 
-    # Create inline keyboard with number buttons
-    buttons = [[{"text": n, "callback_data": f"reply:{n}"} for n in numbers[:4]]]
-    if len(numbers) > 4:
-        buttons.append([{"text": n, "callback_data": f"reply:{n}"} for n in numbers[4:8]])
 
-    return {"inline_keyboard": buttons}
+def extract_buttons_from_response(text: str) -> tuple[str, dict | None, str | None]:
+    """Extract <!-- buttons: ... --> marker from response text.
+
+    Returns (cleaned_text, reply_markup, button_type).
+    button_type: "custom", "confirm", "feedback", or None.
+    """
+    match = BUTTON_MARKER_RE.search(text)
+
+    if not match:
+        # No marker → default feedback buttons
+        return (text, _build_feedback_buttons(), "feedback")
+
+    raw = match.group(1).strip()
+    cleaned = (text[:match.start()] + text[match.end():]).strip()
+
+    if raw.lower() == "confirm":
+        buttons = {"inline_keyboard": [[
+            {"text": "✅ Confirmer", "callback_data": "reply:✅"},
+            {"text": "❌ Annuler", "callback_data": "reply:❌"},
+        ]]}
+        return (cleaned, buttons, "confirm")
+
+    if raw.lower() == "none":
+        return (cleaned, None, None)
+
+    # Try JSON array of labels
+    try:
+        labels = json.loads(raw)
+        if isinstance(labels, list) and all(isinstance(l, str) for l in labels):
+            rows: list[list[dict]] = []
+            row: list[dict] = []
+            for label in labels[:8]:
+                cb_data = f"reply:{label}"
+                # Telegram callback_data max 64 bytes
+                if len(cb_data.encode("utf-8")) > 64:
+                    cb_data = f"reply:{label[:20]}"
+                row.append({"text": label, "callback_data": cb_data})
+                if len(row) == 3:
+                    rows.append(row)
+                    row = []
+            if row:
+                rows.append(row)
+            return (cleaned, {"inline_keyboard": rows}, "custom")
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Couldn't parse → feedback fallback
+    return (cleaned, _build_feedback_buttons(), "feedback")
 
 
 def split_text(text: str, chunk_size: int) -> list[str]:

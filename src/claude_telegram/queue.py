@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -399,7 +400,7 @@ async def process_queue_item(
                 # Short responses like "OK", "Timestamp mis à jour" = nothing to report
                 text = (result.text or "").strip()
                 if text and text.upper() != "OK" and len(text) > 200:
-                    await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id)
+                    await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id, skip_buttons=True)
                 else:
                     logger.info(f"{reminder_type} scan silent (no notable action, len={len(text)})")
                     # Clean up session file to avoid polluting /resume history
@@ -407,7 +408,7 @@ async def process_queue_item(
                         from .claude import delete_session
                         delete_session(result.session_id, runner.working_dir)
             elif result.text and "Claude/Urgent" in result.text:
-                await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id)
+                await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id, skip_buttons=True)
             else:
                 subject = item.metadata.get("subject", "?")
                 logger.info(f"Email triage silent (no Telegram): {subject}")
@@ -431,7 +432,8 @@ async def process_queue_item(
             if escalate_to:
                 logger.info(f"Escalation requested: {item.model or 'default'} → {escalate_to} (source={item.source})")
                 # Build escalation context from previous agent's response
-                summary = response_text.replace("<!-- escalate:sonnet -->", "").replace("<!-- escalate:opus -->", "").replace("<!-- escalate:haiku -->", "").strip()
+                summary = response_text.replace("<!-- escalate:sonnet -->", "").replace("<!-- escalate:opus -->", "").replace("<!-- escalate:haiku -->", "")
+                summary = re.sub(r'<!--\s*buttons:\s*.+?\s*-->', '', summary).strip()
                 if len(summary) > 2000:
                     summary = summary[:2000] + "\n[...tronqué]"
 
