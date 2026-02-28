@@ -49,6 +49,7 @@ CRON_MODELS: dict[str, str | None] = {
     "evening": None,          # default (Sonnet)
     "weekly": None,           # default (Sonnet)
     "calendar-actions": None, # default (Sonnet)
+    "sent-emails": None,      # Sonnet — needs judgment for matching emails to cards
 }
 
 def _load_cron_prompt(reminder_type: str) -> str | None:
@@ -2170,7 +2171,7 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
     logger.info(f"Processing cron reminder: {reminder_type}")
 
     # Silent crons don't create topics
-    silent = reminder_type in ("whatsapp", "gdrive-inbox")
+    silent = reminder_type in ("whatsapp", "gdrive-inbox", "sent-emails")
     thread_id = None
 
     # WhatsApp bridge pre-flight check
