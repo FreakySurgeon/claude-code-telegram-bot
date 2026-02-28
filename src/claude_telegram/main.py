@@ -44,7 +44,7 @@ SPINNER_VERBS = [
 # Model assignment per cron type — lightweight crons use Haiku
 CRON_MODELS: dict[str, str | None] = {
     "whatsapp": "haiku",
-    "gdrive-inbox": "haiku",
+    "gdrive-inbox": None,            # Sonnet — needs good judgment for file classification & routing
     "morning": None,          # default (Sonnet)
     "evening": None,          # default (Sonnet)
     "weekly": None,           # default (Sonnet)
@@ -1890,6 +1890,11 @@ async def _process_email(data: dict, bot: BotConfig):
 
     logger.info(f"Processing email triage: '{subject}' from {from_addr} (fromThomas={is_from_thomas}, hasDraft={has_draft})")
 
+    # Skip self-triage: emails sent by the agent itself (from chauvet.t+claude@gmail.com)
+    if "chauvet.t+claude@gmail.com" in from_addr.lower():
+        logger.info(f"Skipping self-triage email: '{subject}' (sent by agent)")
+        return
+
     # Create a topic for this email triage
     topic_name = generate_provisional_name(f"Email: {subject[:60]}", is_agent=True)
     thread_id = None
@@ -1930,7 +1935,12 @@ async def _process_email(data: dict, bot: BotConfig):
         f"Traite cet email selon les règles de triage.\n"
         f"NE PAS relire l'email via Gmail, le contenu est ci-dessus.\n"
         f"Tu peux par contre utiliser Gmail MCP pour : chercher dans le thread, lire les brouillons, "
-        f"télécharger les pièces jointes, envoyer le résumé, appliquer les labels."
+        f"télécharger les pièces jointes, envoyer le résumé, appliquer les labels.\n\n"
+        f"⚠️ RÈGLE CRITIQUE : Si tu classifies cet email comme `Claude/Info` (newsletter, notification, "
+        f"promo, spam, confirmation de commande, notification calendrier, etc.), tu dois UNIQUEMENT "
+        f"appliquer le label Gmail `Claude/Info` via modify_email. INTERDICTION ABSOLUE d'appeler "
+        f"`send_email` ou `reply` pour les emails classés Info. Zéro email de résumé. "
+        f"Juste le label, puis termine."
     )
 
     if gtd_queue is not None:

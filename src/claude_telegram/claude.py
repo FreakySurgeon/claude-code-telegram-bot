@@ -367,7 +367,7 @@ class ClaudeRunner:
         bypass_permissions: bool = False,
         system_prompt: str | None = None,
         mcp_config: str | None = None,
-        timeout: float = 300,
+        timeout: float = 600,
     ) -> ClaudeResult:
         """
         Run Claude Code with a message.
@@ -382,7 +382,7 @@ class ClaudeRunner:
             bypass_permissions: If True, skip all permission prompts
             system_prompt: Optional system prompt to append (e.g., GTD bot)
             mcp_config: Optional path to MCP config file
-            timeout: Timeout in seconds (default 300s / 5 minutes)
+            timeout: Timeout in seconds (default 600s / 10 minutes)
 
         Returns:
             ClaudeResult with response text and any permission denials
