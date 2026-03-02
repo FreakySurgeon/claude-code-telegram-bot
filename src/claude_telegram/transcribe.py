@@ -77,7 +77,7 @@ async def transcribe_voxtral(audio_path: str) -> TranscriptionResult:
                 "https://api.mistral.ai/v1/audio/transcriptions",
                 headers={"Authorization": f"Bearer {settings.mistral_api_key}"},
                 files={"file": (Path(audio_path).name, f)},
-                data={"model": "voxtral-mini-transcribe-2602", "language": "fr"},
+                data={"model": "voxtral-mini-2602", "language": "fr"},
             )
         if response.status_code != 200:
             raise RuntimeError(f"Voxtral API error {response.status_code}: {response.text}")
