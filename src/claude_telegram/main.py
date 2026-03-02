@@ -1952,7 +1952,7 @@ async def _process_email(data: dict, bot: BotConfig):
             prompt=prompt,
             source="email",
             chat_id=bot.chat_id,
-            model="haiku",
+            model="sonnet",
             new_session=True,
             timeout=900,  # 15 min for email (MCP-heavy: Gmail + Trello + GDrive)
             metadata={"subject": subject, "from": from_addr},
