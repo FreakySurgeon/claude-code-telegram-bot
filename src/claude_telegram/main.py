@@ -43,7 +43,10 @@ SPINNER_VERBS = [
 
 # Pipeline-enabled crons — run Python script instead of Claude CLI + MCP
 # These pipelines pre-assemble context via REST API, then make a single Claude call
-PIPELINE_CRONS = {"morning", "evening", "whatsapp", "sent-emails", "gdrive-inbox"}
+PIPELINE_CRONS = {"morning", "evening", "whatsapp", "sent-emails", "gdrive-inbox", "enrichment"}
+
+# Per-pipeline timeout overrides (default: 600s)
+PIPELINE_TIMEOUTS = {"enrichment": 1800}
 
 # Model assignment per cron type — lightweight crons use Haiku
 CRON_MODELS: dict[str, str | None] = {
@@ -2172,10 +2175,6 @@ async def _process_calendar_actions(bot: BotConfig):
 @app.post("/cron/{reminder_type}")
 async def cron_reminder(reminder_type: str):
     """Handle cron reminders (morning/evening/weekly)."""
-    prompt = _load_cron_prompt(reminder_type)
-    if not prompt:
-        return {"error": f"Unknown reminder type: {reminder_type}"}
-
     gtd_bot = bots.get("gtd")
     if not gtd_bot:
         return {"error": "GTD bot not configured"}
@@ -2184,6 +2183,11 @@ async def cron_reminder(reminder_type: str):
     if reminder_type in PIPELINE_CRONS:
         asyncio.create_task(_process_pipeline_cron(reminder_type, gtd_bot))
         return {"status": "accepted", "type": reminder_type, "mode": "pipeline"}
+
+    # Non-pipeline crons need a prompt file
+    prompt = _load_cron_prompt(reminder_type)
+    if not prompt:
+        return {"error": f"Unknown reminder type: {reminder_type}"}
 
     # Process asynchronously so curl returns immediately
     asyncio.create_task(_process_cron(prompt, reminder_type, gtd_bot))
@@ -2214,11 +2218,12 @@ async def _process_pipeline_cron(reminder_type: str, bot: BotConfig):
 
     try:
         working_dir = settings.gtd_working_dir or "."
+        pipeline_timeout = PIPELINE_TIMEOUTS.get(reminder_type, 600)
         proc = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: sp.run(
                 ["python3", f"{working_dir}/scripts/run_pipeline.py", reminder_type],
-                capture_output=True, text=True, timeout=600,
+                capture_output=True, text=True, timeout=pipeline_timeout,
                 cwd=working_dir,
             ),
         )
