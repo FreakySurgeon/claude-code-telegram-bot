@@ -41,6 +41,10 @@ SPINNER_VERBS = [
     "Wandering", "Whirring", "Wibbling", "Wizarding", "Working", "Wrangling",
 ]
 
+# Pipeline-enabled crons — run Python script instead of Claude CLI + MCP
+# These pipelines pre-assemble context via REST API, then make a single Claude call
+PIPELINE_CRONS = {"morning", "evening"}
+
 # Model assignment per cron type — lightweight crons use Haiku
 CRON_MODELS: dict[str, str | None] = {
     "whatsapp": "haiku",
@@ -1896,6 +1900,19 @@ async def _process_email(data: dict, bot: BotConfig):
         logger.info(f"Skipping self-triage email: '{subject}' (sent by agent)")
         return
 
+    # Skip known automated notifications (defense-in-depth, primary filter is in Apps Script)
+    import re
+    IGNORED_SUBJECT_PATTERNS = [
+        re.compile(r"documents?\s+(patients?\s+)?re[çc]us?", re.IGNORECASE),  # Lifen DMP CMC
+        re.compile(r"dmp\s+cmc", re.IGNORECASE),
+        re.compile(r"lifen", re.IGNORECASE),
+    ]
+    subject_lower = subject.lower()
+    if any(p.search(subject) for p in IGNORED_SUBJECT_PATTERNS):
+        logger.info(f"Skipping ignored subject: '{subject}' (auto-notification filter)")
+        # Apply Claude/Info label via Gmail MCP would require async call; just skip processing
+        return
+
     # Create a topic for this email triage
     topic_name = generate_provisional_name(f"Email: {subject[:60]}", is_agent=True)
     thread_id = None
@@ -2163,10 +2180,72 @@ async def cron_reminder(reminder_type: str):
     if not gtd_bot:
         return {"error": "GTD bot not configured"}
 
+    # Pipeline-enabled crons bypass Claude CLI + MCP entirely
+    if reminder_type in PIPELINE_CRONS:
+        asyncio.create_task(_process_pipeline_cron(reminder_type, gtd_bot))
+        return {"status": "accepted", "type": reminder_type, "mode": "pipeline"}
+
     # Process asynchronously so curl returns immediately
     asyncio.create_task(_process_cron(prompt, reminder_type, gtd_bot))
 
     return {"status": "accepted", "type": reminder_type}
+
+
+async def _process_pipeline_cron(reminder_type: str, bot: BotConfig):
+    """Run a Python pipeline instead of Claude CLI + MCP.
+
+    Pipelines pre-assemble context via REST API calls, then make a single
+    Claude CLI call with --tools "" (no MCP). This reduces token usage by
+    ~60-70% and eliminates MCP zombie processes.
+    """
+    import subprocess as sp
+    from .config import settings
+
+    logger.info(f"Processing pipeline cron: {reminder_type}")
+
+    # Create Telegram topic
+    thread_id = None
+    name = generate_provisional_name(f"Cron: {reminder_type}", is_agent=True)
+    try:
+        result = await telegram.create_forum_topic(bot.chat_id, name, api_url=bot.api_url)
+        thread_id = result["result"]["message_thread_id"]
+    except Exception as e:
+        logger.warning(f"Failed to create topic for pipeline {reminder_type}: {e}")
+
+    try:
+        working_dir = settings.gtd_working_dir or "."
+        proc = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: sp.run(
+                ["python3", f"{working_dir}/scripts/run_pipeline.py", reminder_type],
+                capture_output=True, text=True, timeout=600,
+                cwd=working_dir,
+            ),
+        )
+        output = proc.stdout.strip()
+        if proc.returncode != 0:
+            error_msg = proc.stderr.strip()[:500] if proc.stderr else "Unknown error"
+            logger.error(f"Pipeline {reminder_type} failed (rc={proc.returncode}): {error_msg}")
+            output = f"❌ Pipeline {reminder_type} error:\n<code>{error_msg}</code>"
+
+        if output and output.upper() != "OK":
+            await send_response(output, bot.chat_id, session_name="gtd", api_url=bot.api_url, message_thread_id=thread_id)
+        else:
+            logger.info(f"Pipeline {reminder_type} completed silently")
+    except sp.TimeoutExpired:
+        logger.error(f"Pipeline {reminder_type} timed out (600s)")
+        await telegram.send_message(
+            f"❌ Pipeline {reminder_type} timeout (10 min)",
+            chat_id=bot.chat_id, parse_mode="HTML",
+            api_url=bot.api_url, message_thread_id=thread_id,
+        )
+    except Exception as e:
+        logger.exception(f"Pipeline {reminder_type} error")
+        await telegram.send_message(
+            f"❌ Pipeline {reminder_type} error: <code>{e}</code>",
+            chat_id=bot.chat_id, parse_mode="HTML",
+            api_url=bot.api_url, message_thread_id=thread_id,
+        )
 
 
 async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
