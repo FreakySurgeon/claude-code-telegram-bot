@@ -43,7 +43,7 @@ SPINNER_VERBS = [
 
 # Pipeline-enabled crons — run Python script instead of Claude CLI + MCP
 # These pipelines pre-assemble context via REST API, then make a single Claude call
-PIPELINE_CRONS = {"morning", "evening"}
+PIPELINE_CRONS = {"morning", "evening", "whatsapp", "sent-emails", "gdrive-inbox"}
 
 # Model assignment per cron type — lightweight crons use Haiku
 CRON_MODELS: dict[str, str | None] = {
