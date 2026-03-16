@@ -1888,9 +1888,13 @@ async def email_webhook(request: Request):
 async def webhook_omi(request: Request):
     """Receive Omi Memory Created webhook."""
     # Validate secret — check both header and query param (Omi may use either)
+    # Omi appends ?uid=... to the webhook URL, which can corrupt the secret
+    # if it uses ? instead of & (e.g. ?secret=XXX?uid=YYY)
     secret = request.headers.get("x-webhook-secret", "")
     if not secret:
         secret = request.query_params.get("secret", "")
+        if secret and "?" in secret:
+            secret = secret.split("?")[0]
 
     if not secret or secret != settings.webhook_secret:
         logger.warning("Omi webhook: unauthorized (secret mismatch)")
