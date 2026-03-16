@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from .bots import BotConfig, create_bots
 from .transcribe import transcribe_audio
@@ -43,7 +44,7 @@ SPINNER_VERBS = [
 
 # Pipeline-enabled crons — run Python script instead of Claude CLI + MCP
 # These pipelines pre-assemble context via REST API, then make a single Claude call
-PIPELINE_CRONS = {"morning", "evening", "whatsapp", "sent-emails", "gdrive-inbox", "enrichment"}
+PIPELINE_CRONS = {"morning", "evening", "whatsapp", "sent-emails", "gdrive-inbox", "enrichment", "limitless", "omi"}
 
 # Per-pipeline timeout overrides (default: 600s)
 PIPELINE_TIMEOUTS = {"enrichment": 1800}
@@ -1883,6 +1884,54 @@ async def email_webhook(request: Request):
     return {"status": "accepted"}
 
 
+@app.post("/webhook/omi")
+async def webhook_omi(request: Request):
+    """Receive Omi Memory Created webhook."""
+    # Validate secret — check both header and query param (Omi may use either)
+    secret = request.headers.get("x-webhook-secret", "")
+    if not secret:
+        secret = request.query_params.get("secret", "")
+
+    if not secret or secret != settings.webhook_secret:
+        logger.warning("Omi webhook: unauthorized (secret mismatch)")
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        payload = await request.json()
+    except Exception as e:
+        logger.error(f"Omi webhook: invalid JSON: {e}")
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    memory_id = payload.get("id", "unknown")
+    transcript_segments = payload.get("transcript_segments", [])
+
+    if not transcript_segments:
+        logger.info(f"Omi webhook: empty transcript (memory_id={memory_id}), skipping")
+        return JSONResponse({"status": "ok", "processed": False})
+
+    if payload.get("discarded", False):
+        logger.info(f"Omi webhook: discarded memory (memory_id={memory_id}), skipping")
+        return JSONResponse({"status": "ok", "processed": False})
+
+    # Save payload to pending directory
+    pending_dir = Path(settings.gtd_working_dir) / "data" / "omi-pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    pending_file = pending_dir / f"{memory_id}.json"
+    pending_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    logger.info(f"Omi webhook: saved memory {memory_id} ({len(transcript_segments)} segments), triggering pipeline")
+
+    # Trigger pipeline asynchronously (reuses cron pipeline pattern)
+    gtd_bot = bots.get("gtd")
+    if not gtd_bot:
+        logger.error("Omi webhook: GTD bot not configured")
+        return JSONResponse({"error": "GTD bot not configured"}, status_code=500)
+
+    asyncio.create_task(_process_pipeline_cron("omi", gtd_bot))
+
+    return JSONResponse({"status": "ok", "processed": True, "memory_id": memory_id})
+
+
 async def _process_email(data: dict, bot: BotConfig):
     """Process an incoming email via Claude GTD triage."""
     from_addr = data.get("from", "unknown")
@@ -2238,14 +2287,30 @@ async def _process_pipeline_cron(reminder_type: str, bot: BotConfig):
         else:
             logger.info(f"Pipeline {reminder_type} completed silently")
     except sp.TimeoutExpired:
-        logger.error(f"Pipeline {reminder_type} timed out (600s)")
+        logger.error(f"Pipeline {reminder_type} timed out ({pipeline_timeout}s)")
+        # Clean up stale lock files left by killed subprocesses
+        lock_file = Path(working_dir) / "data" / f".{reminder_type.replace('-', '_')}.lock"
+        if lock_file.exists():
+            lock_file.unlink(missing_ok=True)
+            logger.info(f"Cleaned up stale lock: {lock_file}")
+        # Also check the enrichment lock specifically
+        enrichment_lock = Path(working_dir) / "data" / ".enrichment.lock"
+        if reminder_type == "enrichment" and enrichment_lock.exists():
+            enrichment_lock.unlink(missing_ok=True)
+            logger.info("Cleaned up enrichment lock after timeout")
         await telegram.send_message(
-            f"❌ Pipeline {reminder_type} timeout (10 min)",
+            f"❌ Pipeline {reminder_type} timeout ({pipeline_timeout}s)",
             chat_id=bot.chat_id, parse_mode="HTML",
             api_url=bot.api_url, message_thread_id=thread_id,
         )
     except Exception as e:
         logger.exception(f"Pipeline {reminder_type} error")
+        # Clean up lock files on error too
+        for lock_name in [f".{reminder_type.replace('-', '_')}.lock", ".enrichment.lock"]:
+            lock_file = Path(working_dir) / "data" / lock_name
+            if lock_file.exists():
+                lock_file.unlink(missing_ok=True)
+                logger.info(f"Cleaned up lock after error: {lock_file}")
         await telegram.send_message(
             f"❌ Pipeline {reminder_type} error: <code>{e}</code>",
             chat_id=bot.chat_id, parse_mode="HTML",
