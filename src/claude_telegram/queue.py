@@ -165,6 +165,7 @@ class PersistentQueue:
             "source": item.source,
             "chat_id": item.chat_id,
             "metadata": item.metadata,
+            "model": item.model,
             "continue_session": item.continue_session,
             "bypass_permissions": item.bypass_permissions,
             "new_session": item.new_session,
@@ -197,6 +198,7 @@ class PersistentQueue:
                     source=data["source"],
                     chat_id=data["chat_id"],
                     metadata=data.get("metadata", {}),
+                    model=data.get("model"),
                     continue_session=data.get("continue_session", False),
                     bypass_permissions=data.get("bypass_permissions", True),
                     new_session=data.get("new_session", True),
@@ -407,7 +409,8 @@ async def process_queue_item(
                     if result.session_id:
                         from .claude import delete_session
                         delete_session(result.session_id, runner.working_dir)
-            elif result.text and "Claude/Urgent" in result.text:
+            elif result.text and ("Claude/Urgent" in result.text or "Claude/Action" in result.text or "Claude/Brouillon" in result.text):
+                # Notify Telegram for actionable emails (Urgent, Action, Brouillon préparé)
                 await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id, skip_buttons=True)
             else:
                 subject = item.metadata.get("subject", "?")
