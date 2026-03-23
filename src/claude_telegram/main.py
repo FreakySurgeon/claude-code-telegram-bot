@@ -1948,6 +1948,8 @@ async def _process_email(data: dict, bot: BotConfig):
     is_from_thomas = data.get("isFromThomas", False)
     email_message_id = data.get("messageId", "")
     email_thread_id = data.get("threadId", "")
+    is_reply = data.get("isReply", False)
+    thread_context = data.get("threadContext", "")
 
     logger.info(f"Processing email triage: '{subject}' from {from_addr} (fromThomas={is_from_thomas}, hasDraft={has_draft})")
 
@@ -1991,8 +1993,20 @@ async def _process_email(data: dict, bot: BotConfig):
     if has_draft:
         draft_info = "\n**⚠️ Un brouillon de réponse existe déjà dans ce thread** (probablement Jace). Lis-le via Gmail MCP avant de décider si tu dois en créer un autre.\n"
 
+    # Build reply context info
+    reply_info = ""
+    if is_reply:
+        reply_info = (
+            "\n**🔄 RÉPONSE DANS UN THREAD DÉJÀ TRIÉ** — Ceci est une nouvelle réponse dans une conversation existante. "
+            "Le thread avait déjà été traité mais un nouveau message est arrivé. "
+            "Tu dois re-évaluer la situation : créer/mettre à jour la carte Trello, préparer un brouillon de réponse, "
+            "créer un événement Calendar si pertinent.\n"
+        )
+        if thread_context:
+            reply_info += f"\n**Contexte du thread (messages précédents)** :\n{thread_context}\n"
+
     prompt = (
-        f"📧 **TRIAGE EMAIL** - Applique les règles de la section \"Triage Email\" de ton prompt.\n\n"
+        f"📧 **TRIAGE EMAIL{'  — RÉPONSE' if is_reply else ''}** - Applique les règles de la section \"Triage Email\" de ton prompt.\n\n"
         f"---\n"
         f"**De** : {from_addr}\n"
         f"**À** : {data.get('to', '')}\n"
@@ -2003,7 +2017,8 @@ async def _process_email(data: dict, bot: BotConfig):
         f"**Thread ID** : {email_thread_id}\n"
         f"**Email de Thomas** : {'OUI' if is_from_thomas else 'NON'}\n"
         f"{attachment_info}"
-        f"{draft_info}\n"
+        f"{draft_info}"
+        f"{reply_info}\n"
         f"**Contenu** :\n{body}\n"
         f"---\n\n"
         f"Traite cet email selon les règles de triage.\n"
