@@ -1950,6 +1950,7 @@ async def _process_email(data: dict, bot: BotConfig):
     email_thread_id = data.get("threadId", "")
     is_reply = data.get("isReply", False)
     thread_context = data.get("threadContext", "")
+    thomas_recipient_type = data.get("thomasRecipientType", "to")
 
     logger.info(f"Processing email triage: '{subject}' from {from_addr} (fromThomas={is_from_thomas}, hasDraft={has_draft})")
 
@@ -1993,6 +1994,23 @@ async def _process_email(data: dict, bot: BotConfig):
     if has_draft:
         draft_info = "\n**⚠️ Un brouillon de réponse existe déjà dans ce thread** (probablement Jace). Lis-le via Gmail MCP avant de décider si tu dois en créer un autre.\n"
 
+    # Build CC context info
+    cc_context = ""
+    if thomas_recipient_type == "cc":
+        cc_context = (
+            "\n**📋 THOMAS EST EN COPIE (CC)** — Thomas n'est PAS le destinataire principal de cet email. "
+            "Il est en copie pour information. Adapte ton analyse en conséquence :\n"
+            "- Par défaut, cet email est **informatif** pour Thomas (Claude/Info)\n"
+            "- Ne lui attribue PAS d'action sauf si le contenu le mentionne explicitement ou lui demande quelque chose\n"
+            "- Si un tiers confirme une action (paiement, réponse, validation), **vérifie si une carte Trello existe** pour cette action et marque-la comme terminée\n"
+            "- Note les infos utiles dans `faits-recents.md` (ex: Flora a payé X, un collègue a confirmé Y)\n"
+        )
+    elif thomas_recipient_type == "none":
+        cc_context = (
+            "\n**⚠️ THOMAS N'EST NI EN TO: NI EN CC:** — Cet email est probablement arrivé via un forward ou une liste. "
+            "Traite-le comme informatif sauf preuve du contraire.\n"
+        )
+
     # Build reply context info
     reply_info = ""
     if is_reply:
@@ -2016,6 +2034,8 @@ async def _process_email(data: dict, bot: BotConfig):
         f"**Message ID** : {email_message_id}\n"
         f"**Thread ID** : {email_thread_id}\n"
         f"**Email de Thomas** : {'OUI' if is_from_thomas else 'NON'}\n"
+        f"**Position Thomas** : {'Destinataire principal (To:)' if thomas_recipient_type == 'to' else 'En copie (CC:)' if thomas_recipient_type == 'cc' else 'Ni To: ni CC:'}\n"
+        f"{cc_context}"
         f"{attachment_info}"
         f"{draft_info}"
         f"{reply_info}\n"
@@ -2297,9 +2317,9 @@ async def _process_pipeline_cron(reminder_type: str, bot: BotConfig):
         )
         output = proc.stdout.strip()
         if proc.returncode != 0:
-            error_msg = proc.stderr.strip()[:500] if proc.stderr else "Unknown error"
-            logger.error(f"Pipeline {reminder_type} failed (rc={proc.returncode}): {error_msg}")
-            output = f"❌ Pipeline {reminder_type} error:\n<code>{error_msg}</code>"
+            error_msg = proc.stderr.strip() if proc.stderr else "Unknown error"
+            logger.error(f"Pipeline {reminder_type} failed (rc={proc.returncode}): {error_msg[:2000]}")
+            output = f"❌ Pipeline {reminder_type} error:\n<code>{error_msg[:1500]}</code>"
 
         if output and output.upper() != "OK":
             await send_response(output, bot.chat_id, session_name="gtd", api_url=bot.api_url, message_thread_id=thread_id)
