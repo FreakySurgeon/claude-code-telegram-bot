@@ -412,6 +412,12 @@ async def process_queue_item(
             elif result.text and ("Claude/Urgent" in result.text or "Claude/Action" in result.text or "Claude/Brouillon" in result.text):
                 # Notify Telegram for actionable emails (Urgent, Action, Brouillon préparé)
                 await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id, skip_buttons=True)
+            elif result.text and "Claude/Info" not in result.text and len(result.text) > 150:
+                # Fallback: agent did work (long response) but forgot to include label string
+                # Likely an actionable email — notify rather than silently drop
+                subject = item.metadata.get("subject", "?")
+                logger.warning(f"Email triage fallback notification (no label in text, len={len(result.text)}): {subject}")
+                await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id, skip_buttons=True)
             else:
                 subject = item.metadata.get("subject", "?")
                 logger.info(f"Email triage silent (no Telegram): {subject}")
