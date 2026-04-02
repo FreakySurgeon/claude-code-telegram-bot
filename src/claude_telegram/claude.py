@@ -132,16 +132,18 @@ def find_session_working_dir(session_id: str) -> str | None:
                 return candidate
             # Try parent dirs that exist and check children with underscores/dots
             # e.g. -home-thomas-media-server-docker -> /home/thomas/media_server_docker
+            # Must try all valid parents (don't break early) because a shorter
+            # parent path may exist as a dir (e.g. /home/thomas/projects/revicare)
+            # but the actual path uses underscores at a higher level
+            # (e.g. /home/thomas/projects/revicare_assist)
             parts = dir_name.split("-")
             for i in range(len(parts) - 1, 0, -1):
                 parent = "/" + "/".join(parts[:i])
                 if Path(parent).is_dir():
                     # Check children — try combining remaining parts with _ and .
-                    remaining = "-".join(parts[i:])
                     for child in Path(parent).iterdir():
                         if child.is_dir() and _dir_to_claude_name(str(child)).lstrip("-") == dir_name:
                             return str(child)
-                    break
             # Last resort: return the naive candidate
             return candidate
     return None

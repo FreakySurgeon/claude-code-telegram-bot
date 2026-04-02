@@ -263,9 +263,22 @@ async def process_queue_item(
     # Lazy imports to avoid circular dependency
     from . import telegram
     from .main import send_response, animate_status, get_thinking_message
+    from .topic import generate_provisional_name
 
     session_name = runner.short_name
     silent = item.source == "email" or item.metadata.get("reminder_type") in ("whatsapp", "gdrive-inbox", "sent-emails")
+
+    # Lazy topic creation for emails — only create when we actually need to notify
+    async def _ensure_email_topic():
+        if item.source != "email" or item.thread_id is not None:
+            return
+        subject = item.metadata.get("subject", "(no subject)")
+        topic_name = generate_provisional_name(f"Email: {subject[:60]}", is_agent=True)
+        try:
+            result = await telegram.create_forum_topic(item.chat_id, topic_name, api_url=bot.api_url)
+            item.thread_id = result["result"]["message_thread_id"]
+        except Exception as e:
+            logger.warning(f"Failed to create topic for email triage: {e}")
 
     # Send animated status (skip for emails — no Telegram notification)
     message_id = None
@@ -411,12 +424,14 @@ async def process_queue_item(
                         delete_session(result.session_id, runner.working_dir)
             elif result.text and ("Claude/Urgent" in result.text or "Claude/Action" in result.text or "Claude/Brouillon" in result.text):
                 # Notify Telegram for actionable emails (Urgent, Action, Brouillon préparé)
+                await _ensure_email_topic()
                 await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id, skip_buttons=True)
             elif result.text and "Claude/Info" not in result.text and len(result.text) > 150:
                 # Fallback: agent did work (long response) but forgot to include label string
                 # Likely an actionable email — notify rather than silently drop
                 subject = item.metadata.get("subject", "?")
                 logger.warning(f"Email triage fallback notification (no label in text, len={len(result.text)}): {subject}")
+                await _ensure_email_topic()
                 await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id, skip_buttons=True)
             else:
                 subject = item.metadata.get("subject", "?")

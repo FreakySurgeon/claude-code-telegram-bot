@@ -1972,14 +1972,8 @@ async def _process_email(data: dict, bot: BotConfig):
         # Apply Claude/Info label via Gmail MCP would require async call; just skip processing
         return
 
-    # Create a topic for this email triage
-    topic_name = generate_provisional_name(f"Email: {subject[:60]}", is_agent=True)
+    # Topic created lazily in queue — only when there's output to send (not for Claude/Info)
     thread_id = None
-    try:
-        result = await telegram.create_forum_topic(bot.chat_id, topic_name, api_url=bot.api_url)
-        thread_id = result["result"]["message_thread_id"]
-    except Exception as e:
-        logger.warning(f"Failed to create topic for email triage: {e}")
 
     # Build attachment info
     attachment_info = ""
