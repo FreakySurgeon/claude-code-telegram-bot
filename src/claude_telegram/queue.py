@@ -423,8 +423,10 @@ async def process_queue_item(
                 logger.info(f"Email triage silent (no Telegram): {subject}")
         elif result.text:
             await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id)
-        else:
+        elif item.source != "cron":
             await telegram.send_message("<i>(pas de réponse)</i>", chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url, message_thread_id=item.thread_id)
+        else:
+            logger.info(f"Cron {item.metadata.get('reminder_type', '?')} produced no output, skipping Telegram notification")
 
         # --- Escalation detection ---
         # Agent can request a more powerful model via HTML markers

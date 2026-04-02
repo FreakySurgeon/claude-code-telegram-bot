@@ -2295,14 +2295,20 @@ async def _process_pipeline_cron(reminder_type: str, bot: BotConfig):
 
     logger.info(f"Processing pipeline cron: {reminder_type}")
 
-    # Create Telegram topic
+    # Topic created lazily — only when there's output to send
     thread_id = None
-    name = generate_provisional_name(f"Cron: {reminder_type}", is_agent=True)
-    try:
-        result = await telegram.create_forum_topic(bot.chat_id, name, api_url=bot.api_url)
-        thread_id = result["result"]["message_thread_id"]
-    except Exception as e:
-        logger.warning(f"Failed to create topic for pipeline {reminder_type}: {e}")
+
+    async def _ensure_topic():
+        nonlocal thread_id
+        if thread_id is not None:
+            return thread_id
+        name = generate_provisional_name(f"Cron: {reminder_type}", is_agent=True)
+        try:
+            result = await telegram.create_forum_topic(bot.chat_id, name, api_url=bot.api_url)
+            thread_id = result["result"]["message_thread_id"]
+        except Exception as e:
+            logger.warning(f"Failed to create topic for pipeline {reminder_type}: {e}")
+        return thread_id
 
     try:
         working_dir = settings.gtd_working_dir or "."
@@ -2322,6 +2328,7 @@ async def _process_pipeline_cron(reminder_type: str, bot: BotConfig):
             output = f"❌ Pipeline {reminder_type} error:\n<code>{error_msg[:1500]}</code>"
 
         if output and output.upper() != "OK":
+            await _ensure_topic()
             await send_response(output, bot.chat_id, session_name="gtd", api_url=bot.api_url, message_thread_id=thread_id)
         else:
             logger.info(f"Pipeline {reminder_type} completed silently")
@@ -2337,6 +2344,7 @@ async def _process_pipeline_cron(reminder_type: str, bot: BotConfig):
         if reminder_type == "enrichment" and enrichment_lock.exists():
             enrichment_lock.unlink(missing_ok=True)
             logger.info("Cleaned up enrichment lock after timeout")
+        await _ensure_topic()
         await telegram.send_message(
             f"❌ Pipeline {reminder_type} timeout ({pipeline_timeout}s)",
             chat_id=bot.chat_id, parse_mode="HTML",
@@ -2350,6 +2358,7 @@ async def _process_pipeline_cron(reminder_type: str, bot: BotConfig):
             if lock_file.exists():
                 lock_file.unlink(missing_ok=True)
                 logger.info(f"Cleaned up lock after error: {lock_file}")
+        await _ensure_topic()
         await telegram.send_message(
             f"❌ Pipeline {reminder_type} error: <code>{e}</code>",
             chat_id=bot.chat_id, parse_mode="HTML",
