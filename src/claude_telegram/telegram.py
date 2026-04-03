@@ -1,6 +1,7 @@
 """Telegram bot service."""
 
 import logging
+from pathlib import Path
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
@@ -47,6 +48,43 @@ async def send_message(
         response = await client.post(f"{api}/sendMessage", json=payload)
         if response.status_code != 200:
             logger.error(f"Telegram error: {response.status_code} - {response.text}")
+        response.raise_for_status()
+        return response.json()
+
+
+async def send_photo(
+    photo_path: str,
+    chat_id: str | None = None,
+    caption: str | None = None,
+    parse_mode: str = "HTML",
+    reply_markup: dict | None = None,
+    api_url: str | None = None,
+    message_thread_id: int | None = None,
+) -> dict:
+    """Send a photo to Telegram from a local file path."""
+    api = api_url or DEFAULT_API_URL
+    chat_id = chat_id or settings.telegram_chat_id
+
+    data = {"chat_id": chat_id}
+    if caption:
+        data["caption"] = caption
+    if parse_mode:
+        data["parse_mode"] = parse_mode
+    if reply_markup:
+        import json as _json
+        data["reply_markup"] = _json.dumps(reply_markup)
+    if message_thread_id is not None:
+        data["message_thread_id"] = str(message_thread_id)
+
+    async with httpx.AsyncClient() as client:
+        with open(photo_path, "rb") as f:
+            response = await client.post(
+                f"{api}/sendPhoto",
+                data=data,
+                files={"photo": (Path(photo_path).name, f, "image/png")},
+            )
+        if response.status_code != 200:
+            logger.error(f"Telegram sendPhoto error: {response.status_code} - {response.text}")
         response.raise_for_status()
         return response.json()
 
