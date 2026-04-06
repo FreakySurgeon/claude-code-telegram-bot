@@ -1832,6 +1832,42 @@ async def notify(event_type: str, request: Request):
 
     logger.info(f"notify/{event_type}: working_dir={working_dir}, session_id={session_id}, has_summary={summary is not None}")
 
+    # --- Fitness debrief: enqueue in GTD queue for full skill-based debrief ---
+    if event_type == "fitness-completed" and summary:
+        gtd_bot = bots.get("gtd")
+        if gtd_bot and gtd_queue is not None:
+            # Create a dedicated topic for the debrief
+            try:
+                thread_id = (await _create_topic_for_message(
+                    "🏋️ Debrief séance fitness", gtd_bot.chat_id, gtd_bot,
+                ))
+            except Exception:
+                logger.exception("Failed to create fitness debrief topic")
+                thread_id = None
+
+            prompt = (
+                f"🏋️ Séance terminée — déclenche le debrief fitness.\n\n"
+                f"Résultats de la séance :\n{summary}\n\n"
+                f"Charge le skill fitness-coach (scripts/skills/fitness-coach.txt) "
+                f"et exécute le protocole de debrief post-séance complet."
+            )
+            item = QueueItem(
+                prompt=prompt,
+                source="fitness",
+                chat_id=gtd_bot.chat_id,
+                model="sonnet",
+                new_session=True,
+                timeout=600,
+                metadata={"type": "fitness-debrief"},
+                thread_id=thread_id,
+            )
+            added = await gtd_queue.enqueue(item)
+            logger.info(f"Fitness debrief enqueued: {added}, thread_id={thread_id}")
+            return {"ok": True, "enqueued": added}
+        else:
+            logger.warning("Fitness debrief: no GTD bot or queue available")
+            return {"ok": False, "error": "No GTD bot/queue"}
+
     # Always notify via dev bot — hook.py already skips bot-triggered sessions
     # (CLAUDE_TELEGRAM_BOT env check), so /notify only fires for external CLI
     # sessions (VS Code etc.) which should always go to the dev bot.
