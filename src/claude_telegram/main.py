@@ -44,10 +44,10 @@ SPINNER_VERBS = [
 
 # Pipeline-enabled crons — run Python script instead of Claude CLI + MCP
 # These pipelines pre-assemble context via REST API, then make a single Claude call
-PIPELINE_CRONS = {"morning", "evening", "whatsapp", "sent-emails", "gdrive-inbox", "enrichment", "limitless", "omi"}
+PIPELINE_CRONS = {"morning", "evening", "whatsapp", "sent-emails", "gdrive-inbox", "enrichment", "limitless", "omi", "agent-tasks"}
 
 # Per-pipeline timeout overrides (default: 600s)
-PIPELINE_TIMEOUTS = {"enrichment": 1800}
+PIPELINE_TIMEOUTS = {"enrichment": 1800, "agent-tasks": 1800}
 
 # Model assignment per cron type — lightweight crons use Haiku
 CRON_MODELS: dict[str, str | None] = {
@@ -2014,6 +2014,11 @@ async def _process_email(data: dict, bot: BotConfig):
     # Skip self-triage: emails sent by the agent itself (from chauvet.t+claude@gmail.com)
     if "chauvet.t+claude@gmail.com" in from_addr.lower():
         logger.info(f"Skipping self-triage email: '{subject}' (sent by agent)")
+        return
+
+    # Skip GitHub notifications (defense-in-depth)
+    if "notifications@github.com" in from_addr.lower():
+        logger.info(f"Skipping GitHub notification: '{subject}'")
         return
 
     # Skip known automated notifications (defense-in-depth, primary filter is in Apps Script)
