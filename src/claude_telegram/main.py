@@ -44,10 +44,10 @@ SPINNER_VERBS = [
 
 # Pipeline-enabled crons — run Python script instead of Claude CLI + MCP
 # These pipelines pre-assemble context via REST API, then make a single Claude call
-PIPELINE_CRONS = {"morning", "evening", "whatsapp", "sent-emails", "gdrive-inbox", "enrichment", "limitless", "omi", "agent-tasks"}
+PIPELINE_CRONS = {"morning", "evening", "whatsapp", "sent-emails", "gdrive-inbox", "enrichment", "limitless", "omi", "agent-tasks", "garmin-sync"}
 
 # Per-pipeline timeout overrides (default: 600s)
-PIPELINE_TIMEOUTS = {"enrichment": 1800, "agent-tasks": 1800}
+PIPELINE_TIMEOUTS = {"enrichment": 1800, "agent-tasks": 1800, "garmin-sync": 300}
 
 # Model assignment per cron type — lightweight crons use Haiku
 CRON_MODELS: dict[str, str | None] = {
