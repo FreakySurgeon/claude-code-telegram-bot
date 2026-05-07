@@ -2027,11 +2027,16 @@ async def _process_email(data: dict, bot: BotConfig):
         re.compile(r"documents?\s+(patients?\s+)?re[çc]us?", re.IGNORECASE),  # Lifen DMP CMC
         re.compile(r"dmp\s+cmc", re.IGNORECASE),
         re.compile(r"lifen", re.IGNORECASE),
+        re.compile(r"nouveau message s[eé]curis[eé] re[çc]u sur mailiz", re.IGNORECASE),  # Mailiz
     ]
-    subject_lower = subject.lower()
+    IGNORED_SENDER_PATTERNS = [
+        re.compile(r"healthchecks\.io", re.IGNORECASE),  # Revicare monitoring
+    ]
     if any(p.search(subject) for p in IGNORED_SUBJECT_PATTERNS):
         logger.info(f"Skipping ignored subject: '{subject}' (auto-notification filter)")
-        # Apply Claude/Info label via Gmail MCP would require async call; just skip processing
+        return
+    if any(p.search(from_addr) for p in IGNORED_SENDER_PATTERNS):
+        logger.info(f"Skipping ignored sender: '{from_addr}' (auto-notification filter)")
         return
 
     # Topic created lazily in queue — only when there's output to send (not for Claude/Info)
