@@ -371,6 +371,8 @@ async def process_queue_item(
             model=item.model,
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
+            cache_creation_tokens=result.cache_creation_tokens,
+            cache_read_tokens=result.cache_read_tokens,
             cost_usd=result.cost_usd,
             num_turns=result.num_turns,
             duration_s=_run_duration,

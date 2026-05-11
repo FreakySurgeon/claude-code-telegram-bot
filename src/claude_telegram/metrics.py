@@ -23,6 +23,8 @@ def write_metric(
     duration_api_ms: int,
     status: str,
     session_id: str | None,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
 ) -> None:
     """Append a metric line to the JSONL log."""
     entry = {
@@ -32,6 +34,8 @@ def write_metric(
         "model": model or "default",
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "cache_creation_tokens": cache_creation_tokens,
+        "cache_read_tokens": cache_read_tokens,
         "cost_usd": cost_usd,
         "num_turns": num_turns,
         "duration_s": round(duration_s, 1),

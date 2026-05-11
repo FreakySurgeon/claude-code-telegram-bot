@@ -33,6 +33,8 @@ class ClaudeResult:
     cost_usd: float | None = None
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
     num_turns: int = 0
     duration_api_ms: int = 0
 
@@ -391,6 +393,12 @@ class ClaudeRunner:
         """
         cmd = [self.cli_path, "--print", "--output-format", "stream-json", "--verbose"]
 
+        # Skip project CLAUDE.md for fresh prod runs (cron, webhooks, topic auto-creation).
+        # Interactive sessions (continue_session/resume) keep full project context.
+        # See docs/plans/2026-05-11-separate-dev-prod-claude-context.md
+        if new_session:
+            cmd.extend(["--setting-sources", "user"])
+
         # Select model if specified
         if model:
             cmd.extend(["--model", model])
@@ -481,6 +489,8 @@ class ClaudeRunner:
         result_duration_api_ms = 0
         result_input_tokens = 0
         result_output_tokens = 0
+        result_cache_creation_tokens = 0
+        result_cache_read_tokens = 0
 
         async for line in self.current_process.stdout:
             decoded = line.decode("utf-8", errors="replace").strip()
@@ -502,6 +512,8 @@ class ClaudeRunner:
                     usage = event.get("usage") or {}
                     result_input_tokens = usage.get("input_tokens", 0)
                     result_output_tokens = usage.get("output_tokens", 0)
+                    result_cache_creation_tokens = usage.get("cache_creation_input_tokens", 0)
+                    result_cache_read_tokens = usage.get("cache_read_input_tokens", 0)
                     # Parse permission denials
                     for denial in event.get("permission_denials", []):
                         permission_denials.append(PermissionDenial(
@@ -595,6 +607,8 @@ class ClaudeRunner:
             cost_usd=result_cost_usd,
             input_tokens=result_input_tokens,
             output_tokens=result_output_tokens,
+            cache_creation_tokens=result_cache_creation_tokens,
+            cache_read_tokens=result_cache_read_tokens,
             num_turns=result_num_turns,
             duration_api_ms=result_duration_api_ms,
         )
