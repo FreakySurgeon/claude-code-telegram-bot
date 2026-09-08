@@ -4,6 +4,7 @@ import asyncio
 import html
 import json
 import logging
+import os
 import random
 import re
 from contextlib import asynccontextmanager
@@ -44,10 +45,10 @@ SPINNER_VERBS = [
 
 # Pipeline-enabled crons — run Python script instead of Claude CLI + MCP
 # These pipelines pre-assemble context via REST API, then make a single Claude call
-PIPELINE_CRONS = {"morning", "evening", "whatsapp", "sent-emails", "gdrive-inbox", "enrichment", "limitless", "omi", "agent-tasks", "garmin-sync"}
+PIPELINE_CRONS = {"morning", "evening", "whatsapp", "sent-emails", "gdrive-inbox", "enrichment", "limitless", "omi", "agent-tasks", "garmin-sync", "weekly", "zulip"}
 
 # Per-pipeline timeout overrides (default: 600s)
-PIPELINE_TIMEOUTS = {"enrichment": 1800, "agent-tasks": 1800, "garmin-sync": 300}
+PIPELINE_TIMEOUTS = {"enrichment": 1800, "agent-tasks": 1800, "garmin-sync": 300, "weekly": 1800, "zulip": 1200}
 
 # Model assignment per cron type — lightweight crons use Haiku
 CRON_MODELS: dict[str, str | None] = {
@@ -2157,6 +2158,55 @@ async def _process_email(data: dict, bot: BotConfig):
                 chat_id=bot.chat_id, parse_mode="HTML", api_url=bot.api_url,
                 message_thread_id=thread_id,
             )
+
+
+@app.post("/webhook/zulip")
+async def webhook_zulip(request: Request):
+    """Receive a Zulip outgoing-webhook bot mention or DM.
+
+    Zulip times out quickly, so we only persist the payload and return an
+    empty body (which tells Zulip to post nothing). The agent's real answer
+    is posted back into the thread by scripts/pipelines/zulip.py.
+    """
+    import hmac
+    from .config import settings
+
+    try:
+        payload = await request.json()
+    except Exception as e:
+        logger.error(f"Zulip webhook: invalid JSON: {e}")
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    # Zulip authenticates itself with the bot service token in the body.
+    expected = os.environ.get("ZULIP_WEBHOOK_TOKEN", "")
+    got = payload.get("token", "")
+    if not expected or not hmac.compare_digest(str(got), expected):
+        logger.warning("Zulip webhook: unauthorized (token mismatch)")
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    message = payload.get("message", {}) or {}
+    message_id = message.get("id", "unknown")
+
+    if not (payload.get("data") or message.get("content", "")).strip():
+        logger.info(f"Zulip webhook: empty message {message_id}, skipping")
+        return JSONResponse({})
+
+    pending_dir = Path(settings.gtd_working_dir) / "data" / "zulip-pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    (pending_dir / f"{message_id}.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2)
+    )
+    logger.info(f"Zulip webhook: queued message {message_id} from {message.get('sender_email','?')}")
+
+    gtd_bot = bots.get("gtd")
+    if not gtd_bot:
+        logger.error("Zulip webhook: GTD bot not configured")
+        return JSONResponse({"error": "GTD bot not configured"}, status_code=500)
+
+    asyncio.create_task(_process_pipeline_cron("zulip", gtd_bot))
+
+    # Empty object = "bot has nothing to say right now".
+    return JSONResponse({})
 
 
 @app.post("/cron/calendar-actions")
