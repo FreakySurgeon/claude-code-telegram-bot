@@ -225,7 +225,7 @@ def interactive_chain() -> list[str]:
 def telegram_notifier(bot) -> Notifier:
     """Alert callback posting to the bot's own chat (plain text)."""
     async def _notify(text: str, severity: str) -> None:
-        from .telegram import send_message
+        from .adapters.telegram.api import send_message
         prefix = "🚨 " if severity == "urgent" else ""
         await send_message(prefix + text, chat_id=bot.chat_id, parse_mode=None, api_url=bot.api_url)
     return _notify

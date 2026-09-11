@@ -53,7 +53,7 @@ def mock_settings():
 @pytest.fixture
 def mock_httpx():
     """Mock httpx for Telegram API calls."""
-    with patch("claude_telegram.telegram.httpx.AsyncClient") as mock:
+    with patch("claude_telegram.adapters.telegram.api.httpx.AsyncClient") as mock:
         client = AsyncMock()
         mock.return_value.__aenter__.return_value = client
         mock.return_value.__aexit__.return_value = None

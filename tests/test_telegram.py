@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import httpx
 
 # Import after setting env vars in conftest
-from claude_telegram import telegram
+from claude_telegram.adapters.telegram import api as telegram
 
 
 @pytest.mark.asyncio

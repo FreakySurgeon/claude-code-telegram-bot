@@ -7,7 +7,7 @@ import subprocess
 
 import httpx
 
-from . import telegram
+from .adapters.telegram import api as telegram
 from .config import settings
 
 logger = logging.getLogger(__name__)

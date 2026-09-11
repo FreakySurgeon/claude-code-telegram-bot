@@ -261,8 +261,8 @@ async def process_queue_item(
 ):
     """Process a single queue item: run Claude, handle timeout/retry, send response."""
     # Lazy imports to avoid circular dependency
-    from . import telegram
-    from .main import send_response, animate_status, get_thinking_message
+    from .adapters.telegram import api as telegram
+    from .adapters.telegram.outbound import send_response, animate_status, get_thinking_message
     from .topic import generate_provisional_name
 
     session_name = runner.short_name

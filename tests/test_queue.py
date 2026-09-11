@@ -122,11 +122,11 @@ async def test_process_queue_item_success(mock_bot):
     mock_runner.short_name = "gtd"
 
     # Patch at the source so lazy imports pick up mocks
-    with patch("claude_telegram.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}) as mock_tg_send, \
-         patch("claude_telegram.telegram.delete_message", new_callable=AsyncMock) as mock_tg_del, \
-         patch("claude_telegram.main.send_response", new_callable=AsyncMock) as mock_send, \
-         patch("claude_telegram.main.animate_status", new_callable=AsyncMock), \
-         patch("claude_telegram.main.get_thinking_message", return_value="✨ <i>Thinking...</i>"):
+    with patch("claude_telegram.adapters.telegram.api.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}) as mock_tg_send, \
+         patch("claude_telegram.adapters.telegram.api.delete_message", new_callable=AsyncMock) as mock_tg_del, \
+         patch("claude_telegram.adapters.telegram.outbound.send_response", new_callable=AsyncMock) as mock_send, \
+         patch("claude_telegram.adapters.telegram.outbound.animate_status", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.get_thinking_message", return_value="✨ <i>Thinking...</i>"):
         await process_queue_item(item, mock_runner, mock_bot)
         mock_runner.run.assert_called_once()
         mock_send.assert_called_once()
@@ -142,11 +142,11 @@ async def test_process_queue_item_timeout_retries(mock_bot):
 
     q = RequestQueue(maxsize=10)
 
-    with patch("claude_telegram.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}), \
-         patch("claude_telegram.telegram.delete_message", new_callable=AsyncMock), \
-         patch("claude_telegram.main.send_response", new_callable=AsyncMock), \
-         patch("claude_telegram.main.animate_status", new_callable=AsyncMock), \
-         patch("claude_telegram.main.get_thinking_message", return_value="✨ <i>Thinking...</i>"):
+    with patch("claude_telegram.adapters.telegram.api.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}), \
+         patch("claude_telegram.adapters.telegram.api.delete_message", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.send_response", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.animate_status", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.get_thinking_message", return_value="✨ <i>Thinking...</i>"):
         await process_queue_item(item, mock_runner, mock_bot, queue=q)
 
     assert q.size == 1
@@ -165,11 +165,11 @@ async def test_process_queue_item_timeout_no_second_retry(mock_bot):
 
     q = RequestQueue(maxsize=10)
 
-    with patch("claude_telegram.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}), \
-         patch("claude_telegram.telegram.delete_message", new_callable=AsyncMock), \
-         patch("claude_telegram.main.send_response", new_callable=AsyncMock), \
-         patch("claude_telegram.main.animate_status", new_callable=AsyncMock), \
-         patch("claude_telegram.main.get_thinking_message", return_value="✨ <i>Thinking...</i>"):
+    with patch("claude_telegram.adapters.telegram.api.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}), \
+         patch("claude_telegram.adapters.telegram.api.delete_message", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.send_response", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.animate_status", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.get_thinking_message", return_value="✨ <i>Thinking...</i>"):
         await process_queue_item(item, mock_runner, mock_bot, queue=q)
 
     assert q.size == 0
@@ -294,11 +294,11 @@ async def test_process_queue_item_quota_error_persists(mock_bot, tmp_path):
     ))
     mock_runner.short_name = "gtd"
 
-    with patch("claude_telegram.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}) as mock_send, \
-         patch("claude_telegram.telegram.delete_message", new_callable=AsyncMock), \
-         patch("claude_telegram.main.send_response", new_callable=AsyncMock), \
-         patch("claude_telegram.main.animate_status", new_callable=AsyncMock), \
-         patch("claude_telegram.main.get_thinking_message", return_value="✨"):
+    with patch("claude_telegram.adapters.telegram.api.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}) as mock_send, \
+         patch("claude_telegram.adapters.telegram.api.delete_message", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.send_response", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.animate_status", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.get_thinking_message", return_value="✨"):
         await process_queue_item(item, mock_runner, mock_bot,
                                  persistent_queue=pqueue, api_status=api_status)
 
@@ -321,11 +321,11 @@ async def test_process_queue_item_success_clears_unavailable(mock_bot, tmp_path)
     mock_runner.run = AsyncMock(return_value=ClaudeResult(text="Response", permission_denials=[]))
     mock_runner.short_name = "gtd"
 
-    with patch("claude_telegram.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}), \
-         patch("claude_telegram.telegram.delete_message", new_callable=AsyncMock), \
-         patch("claude_telegram.main.send_response", new_callable=AsyncMock), \
-         patch("claude_telegram.main.animate_status", new_callable=AsyncMock), \
-         patch("claude_telegram.main.get_thinking_message", return_value="✨"):
+    with patch("claude_telegram.adapters.telegram.api.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}), \
+         patch("claude_telegram.adapters.telegram.api.delete_message", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.send_response", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.animate_status", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.get_thinking_message", return_value="✨"):
         await process_queue_item(item, mock_runner, mock_bot,
                                  persistent_queue=pqueue, api_status=api_status)
 
@@ -347,11 +347,11 @@ async def test_full_unavailability_and_recovery_flow(mock_bot, tmp_path):
     ))
     mock_runner.short_name = "gtd"
 
-    with patch("claude_telegram.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}), \
-         patch("claude_telegram.telegram.delete_message", new_callable=AsyncMock), \
-         patch("claude_telegram.main.send_response", new_callable=AsyncMock), \
-         patch("claude_telegram.main.animate_status", new_callable=AsyncMock), \
-         patch("claude_telegram.main.get_thinking_message", return_value="✨"):
+    with patch("claude_telegram.adapters.telegram.api.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}), \
+         patch("claude_telegram.adapters.telegram.api.delete_message", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.send_response", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.animate_status", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.get_thinking_message", return_value="✨"):
         await process_queue_item(item1, mock_runner, mock_bot, queue=q,
                                  persistent_queue=pqueue, api_status=status)
 
@@ -364,11 +364,11 @@ async def test_full_unavailability_and_recovery_flow(mock_bot, tmp_path):
     mock_runner.run = AsyncMock(return_value=ClaudeResult(text="I'm back!", permission_denials=[]))
     item2 = QueueItem(prompt="New message", source="telegram", chat_id="12345")
 
-    with patch("claude_telegram.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 2}}), \
-         patch("claude_telegram.telegram.delete_message", new_callable=AsyncMock), \
-         patch("claude_telegram.main.send_response", new_callable=AsyncMock) as mock_send, \
-         patch("claude_telegram.main.animate_status", new_callable=AsyncMock), \
-         patch("claude_telegram.main.get_thinking_message", return_value="✨"):
+    with patch("claude_telegram.adapters.telegram.api.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 2}}), \
+         patch("claude_telegram.adapters.telegram.api.delete_message", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.send_response", new_callable=AsyncMock) as mock_send, \
+         patch("claude_telegram.adapters.telegram.outbound.animate_status", new_callable=AsyncMock), \
+         patch("claude_telegram.adapters.telegram.outbound.get_thinking_message", return_value="✨"):
         await process_queue_item(item2, mock_runner, mock_bot, queue=q,
                                  persistent_queue=pqueue, api_status=status)
 

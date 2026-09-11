@@ -5,7 +5,6 @@ import html
 import json
 import logging
 import os
-import random
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -23,25 +22,6 @@ from fastapi.responses import JSONResponse
 from .bots import BotConfig, create_bots
 from .transcribe import transcribe_audio
 
-# Claude Code spinner words (from the CLI)
-# Source: https://github.com/levindixon/tengu_spinner_words
-SPINNER_VERBS = [
-    "Accomplishing", "Actioning", "Actualizing", "Baking", "Booping", "Brewing",
-    "Calculating", "Cerebrating", "Channelling", "Churning", "Clauding", "Coalescing",
-    "Cogitating", "Combobulating", "Computing", "Concocting", "Conjuring", "Considering",
-    "Contemplating", "Cooking", "Crafting", "Creating", "Crunching", "Deciphering",
-    "Deliberating", "Determining", "Discombobulating", "Divining", "Doing", "Effecting",
-    "Elucidating", "Enchanting", "Envisioning", "Finagling", "Flibbertigibbeting",
-    "Forging", "Forming", "Frolicking", "Generating", "Germinating", "Hatching",
-    "Herding", "Honking", "Hustling", "Ideating", "Imagining", "Incubating", "Inferring",
-    "Jiving", "Manifesting", "Marinating", "Meandering", "Moseying", "Mulling",
-    "Mustering", "Musing", "Noodling", "Percolating", "Perusing", "Philosophising",
-    "Pondering", "Pontificating", "Processing", "Puttering", "Puzzling", "Reticulating",
-    "Ruminating", "Scheming", "Schlepping", "Shimmying", "Shucking", "Simmering",
-    "Smooshing", "Spelunking", "Spinning", "Stewing", "Sussing", "Synthesizing",
-    "Thinking", "Tinkering", "Transmuting", "Unfurling", "Unravelling", "Vibing",
-    "Wandering", "Whirring", "Wibbling", "Wizarding", "Working", "Wrangling",
-]
 
 # Pipeline-enabled crons — run Python script instead of Claude CLI + MCP
 # These pipelines pre-assemble context via REST API, then make a single Claude call
@@ -91,20 +71,16 @@ def _load_post_session_prompt() -> str | None:
         logger.error(f"Failed to read post-session prompt: {e}")
         return None
 
-def get_thinking_message() -> str:
-    """Get a random thinking message with emoji."""
-    verb = random.choice(SPINNER_VERBS)
-    return f"✨ <i>{verb}...</i>"
-
-def get_continue_message() -> str:
-    """Get a random continue message with emoji."""
-    verb = random.choice(SPINNER_VERBS)
-    return f"🔄 <i>{verb}...</i>"
-
-from . import telegram
+from .adapters.telegram import api as telegram
+from .adapters.telegram.outbound import (
+    animate_status,
+    get_continue_message,
+    get_thinking_message,
+    send_response,
+)
 from .claude import sessions, ClaudeResult, PermissionDenial, get_session_permission_mode, list_recent_sessions, read_session_messages, find_session_working_dir
 from .config import settings
-from .markdown import markdown_to_telegram_html
+from .markdown import markdown_to_telegram_html, split_text
 from .tunnel import tunnel, CloudflareTunnel
 from .queue import QueueItem, RequestQueue, process_queue_item, PersistentQueue, ApiStatus
 from .topic import generate_provisional_name, extract_title_from_response, generate_title_fallback, format_topic_name, working_dir_name
@@ -1430,22 +1406,6 @@ async def handle_callback(callback: dict, bot: BotConfig):
         await run_claude(original_message, str(chat_id), bot, continue_session=True, bypass_permissions=True, thread_id=callback_thread_id)
 
 
-async def animate_status(chat_id: str, message_id: int, continue_session: bool, session_name: str, api_url: str | None = None, message_thread_id: int | None = None):
-    """Animate the status message with rotating messages."""
-    prefix = f"[<code>{session_name}</code>] " if session_name != "default" else ""
-    try:
-        while True:
-            await asyncio.sleep(2.5)  # Update every 2.5 seconds
-            status = get_continue_message() if continue_session else get_thinking_message()
-            new_status = f"{prefix}{status}"
-            try:
-                await telegram.edit_message(message_id, new_status, chat_id, parse_mode="HTML", api_url=api_url)
-            except Exception:
-                pass  # Ignore edit errors (message may be deleted)
-    except asyncio.CancelledError:
-        pass
-
-
 async def run_claude(
     message: str,
     chat_id: str,
@@ -1676,148 +1636,6 @@ async def send_permission_request(
             api_url=bot.api_url,
             message_thread_id=thread_id,
         )
-
-
-async def send_response(text: str, chat_id: str, chunk_size: int = 4000, session_name: str = "default", api_url: str | None = None, message_thread_id: int | None = None, skip_buttons: bool = False):
-    """Send Claude's response with smart button detection."""
-    if not text.strip():
-        await telegram.send_message(
-            "<i>(no output)</i>",
-            chat_id=chat_id,
-            parse_mode="HTML",
-            api_url=api_url,
-            message_thread_id=message_thread_id,
-        )
-        return
-
-    # Extract buttons from raw text (before markdown conversion)
-    if skip_buttons:
-        cleaned_text = text
-        buttons = None
-    else:
-        cleaned_text, buttons, _button_type = extract_buttons_from_response(text)
-
-    # Convert markdown to Telegram HTML
-    html_text = markdown_to_telegram_html(cleaned_text)
-
-    # Split into chunks if needed
-    chunks = split_text(html_text, chunk_size)
-
-    for i, chunk in enumerate(chunks):
-        is_last = i == len(chunks) - 1
-        reply_markup = buttons if (is_last and buttons) else None
-        try:
-            await telegram.send_message(
-                chunk,
-                chat_id=chat_id,
-                parse_mode="HTML",
-                reply_markup=reply_markup,
-                api_url=api_url,
-                message_thread_id=message_thread_id,
-            )
-        except Exception as e:
-            # Fallback to plain text if HTML fails
-            logger.warning(f"HTML parse failed, falling back to plain text: {e}")
-            await telegram.send_message(
-                text if len(chunks) == 1 else chunk,
-                chat_id=chat_id,
-                parse_mode=None,
-                reply_markup=reply_markup,
-                api_url=api_url,
-                message_thread_id=message_thread_id,
-            )
-        if not is_last:
-            await asyncio.sleep(0.5)
-
-
-BUTTON_MARKER_RE = re.compile(r'<!--\s*buttons:\s*(.+?)\s*-->')
-
-
-def _build_feedback_buttons() -> dict:
-    """Build the default 👍/👎 feedback buttons."""
-    return {"inline_keyboard": [[
-        {"text": "👍", "callback_data": "feedback:up"},
-        {"text": "👎", "callback_data": "feedback:down"},
-    ]]}
-
-
-def extract_buttons_from_response(text: str) -> tuple[str, dict | None, str | None]:
-    """Extract <!-- buttons: ... --> marker from response text.
-
-    Returns (cleaned_text, reply_markup, button_type).
-    button_type: "custom", "confirm", "feedback", or None.
-    """
-    match = BUTTON_MARKER_RE.search(text)
-
-    if not match:
-        # No marker → default feedback buttons
-        return (text, _build_feedback_buttons(), "feedback")
-
-    raw = match.group(1).strip()
-    cleaned = (text[:match.start()] + text[match.end():]).strip()
-
-    if raw.lower() == "confirm":
-        buttons = {"inline_keyboard": [[
-            {"text": "✅ Confirmer", "callback_data": "reply:✅"},
-            {"text": "❌ Annuler", "callback_data": "reply:❌"},
-        ]]}
-        return (cleaned, buttons, "confirm")
-
-    if raw.lower() == "none":
-        return (cleaned, None, None)
-
-    # Try JSON array of labels
-    try:
-        labels = json.loads(raw)
-        if isinstance(labels, list) and all(isinstance(l, str) for l in labels):
-            rows: list[list[dict]] = []
-            row: list[dict] = []
-            for label in labels[:8]:
-                cb_data = f"reply:{label}"
-                # Telegram callback_data max 64 bytes
-                if len(cb_data.encode("utf-8")) > 64:
-                    cb_data = f"reply:{label[:20]}"
-                row.append({"text": label, "callback_data": cb_data})
-                if len(row) == 3:
-                    rows.append(row)
-                    row = []
-            if row:
-                rows.append(row)
-            return (cleaned, {"inline_keyboard": rows}, "custom")
-    except (json.JSONDecodeError, TypeError):
-        pass
-
-    # Couldn't parse → feedback fallback
-    return (cleaned, _build_feedback_buttons(), "feedback")
-
-
-def split_text(text: str, chunk_size: int) -> list[str]:
-    """Split text into chunks, trying to break at newlines."""
-    if len(text) <= chunk_size:
-        return [text]
-
-    chunks = []
-    current = ""
-
-    for line in text.split("\n"):
-        if len(line) > chunk_size:
-            # Line itself exceeds chunk_size — flush current, then hard-split the line
-            if current:
-                chunks.append(current)
-                current = ""
-            for i in range(0, len(line), chunk_size):
-                chunks.append(line[i:i + chunk_size])
-        elif len(current) + len(line) + 1 > chunk_size:
-            if current:
-                chunks.append(current)
-            current = line
-        else:
-            current = f"{current}\n{line}" if current else line
-
-    if current:
-        chunks.append(current)
-
-    return chunks
 
 
 @app.post("/notify/{event_type}")
