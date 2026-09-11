@@ -1,0 +1,38 @@
+# Channel routing policy (read from the `channels` key of the file pointed to
+# by CHANNEL_ROUTING_PATH). Without that variable, everything goes to Telegram.
+#
+# ${VAR} placeholders are expanded from the environment, merged with the
+# optional dotenv file CHANNEL_ENV_FILE (values are not exported).
+#
+# Severity is decided by the event producer:
+#   urgent -> every channel in `urgent`
+#   normal / info -> the `default` channel
+# A channel's `only_severity` list drops everything else for that channel.
+
+channels:
+  default: zulip              # conversations + information
+  urgent: [telegram, zulip]   # urgent: Telegram, plus a copy in Zulip for history
+
+  zulip:
+    site: ${ZULIP_SITE}
+    host_header: ${ZULIP_HOST_HEADER}   # optional: public hostname when site is a LAN address
+    bot_email: ${ZULIP_BOT_EMAIL}
+    api_key: ${ZULIP_BOT_API_KEY}
+    listen_streams: [daily]             # the agent answers EVERY message here
+    mention_streams: [general, home]    # the agent answers only on @mention
+    dm: true                            # direct messages always answered
+    session_ttl_hours: 12               # idle topic -> fresh Claude session
+    context_prompt: /path/to/zulip-context.txt   # appended to the system prompt for Zulip conversations
+    outputs:                            # event type -> stream/topic ({date}, {title} available)
+      briefing_morning: {stream: agent, topic: "Morning briefing"}
+      briefing_evening: {stream: agent, topic: "Evening debrief"}
+      email_triage:     {stream: agent, topic: "Email triage"}
+      llm_provider:     {stream: agent, topic: "Infra"}
+      fitness:          {stream: sport, topic: "Session {date}"}
+      calendar_action:  {stream: agent, topic: "Calendar: {title}"}
+      default:          {stream: agent, topic: "Misc"}
+
+  telegram:
+    bot: gtd                              # which Telegram bot receives events
+    only_severity: [urgent]               # Telegram only gets urgent events
+    dev_bot_events: [completed, waiting]  # /notify/<event> forwarded to the dev bot
