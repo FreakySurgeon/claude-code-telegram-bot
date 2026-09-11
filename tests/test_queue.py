@@ -459,6 +459,23 @@ async def test_email_urgent_publishes_urgent_event(mock_bot, clear_provider_stat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("text", [
+    "OK",
+    "OK — email inconnu de la webapp",
+    "[Claude/Action] Facture à classer",
+    "Proposition enregistrée. " + "x" * 400,
+])
+async def test_email_non_urgent_publishes_nothing(mock_bot, clear_provider_state, text):
+    item = QueueItem(prompt="triage", source="email", metadata={"subject": "Facture"})
+    runner = _runner(ClaudeResult(text=text, permission_denials=[]))
+    notifications = FakeNotifications()
+
+    await process_queue_item(item, runner, mock_bot, notifications=notifications)
+
+    assert notifications.published == [] and notifications.replies == [] and notifications.started == []
+
+
+@pytest.mark.asyncio
 async def test_whatsapp_scan_ok_publishes_nothing(mock_bot, clear_provider_state):
     item = QueueItem(prompt="scan", source="cron", metadata={"reminder_type": "whatsapp"})
     runner = _runner(ClaudeResult(text="OK", permission_denials=[]))

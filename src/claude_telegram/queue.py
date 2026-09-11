@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+from .email_prompt import should_notify_email
 from .ports import ConversationRef, Event
 from .routing import event_type_for
 
@@ -304,7 +305,8 @@ def _event_notifier(notifications):
 def _silent_event(item: QueueItem, text: str) -> Event | None:
     """Event for a silent source (email triage, periodic scans), or None to stay quiet.
 
-    Same thresholds as the historical Telegram behaviour.
+    Scans keep the historical threshold (non-OK answer over 200 chars). Email
+    triage only notifies urgent emails: proposals live in the inbox webapp.
     """
     reminder_type = item.metadata.get("reminder_type", "")
     text = text or ""
@@ -313,18 +315,10 @@ def _silent_event(item: QueueItem, text: str) -> Event | None:
         if stripped and stripped.upper() != "OK" and len(stripped) > 200:
             return Event(item.event_type or event_type_for(reminder_type), "normal", body=text)
         return None
+    if not should_notify_email(text):
+        return None
     subject = item.metadata.get("subject", "(no subject)")
-    title = f"Email: {subject[:60]}"
-    event_type = item.event_type or "email_triage"
-    if "Claude/Urgent" in text:
-        return Event(event_type, "urgent", title=title, body=text)
-    if "Claude/Action" in text or "Claude/Brouillon" in text:
-        return Event(event_type, "normal", title=title, body=text)
-    if text and "Claude/Info" not in text and len(text) > 150:
-        # Agent did work (long response) but forgot the label string: notify rather than drop
-        logger.warning(f"Email triage fallback notification (no label in text, len={len(text)}): {subject}")
-        return Event(event_type, "normal", title=title, body=text)
-    return None
+    return Event(item.event_type or "email_triage", "urgent", title=f"Email: {subject[:60]}", body=text)
 
 
 async def _rename_default_topic(notifications, ref: ConversationRef, item: QueueItem, text: str,
