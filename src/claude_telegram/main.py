@@ -106,6 +106,53 @@ def _notifier() -> NotificationService:
     return NotificationService(policy, build_outbounds(policy, state.bots, settings.resolved_data_dir))
 
 
+async def _submit_to_gtd_queue(item: QueueItem) -> int | None:
+    """Queue position of the item, or None when the GTD queue is full/missing."""
+    if state.gtd_queue is None or not await state.gtd_queue.enqueue(item):
+        return None
+    return state.gtd_queue.size
+
+
+def _start_zulip_inbound(policy: RoutingPolicy, outbound, data_dir: Path, gtd_bot: BotConfig) -> None:
+    """Listen to Zulip through its event queue and route messages to the ConversationService."""
+    from .adapters import ZULIP_STATE_FILE
+    from .adapters.zulip.inbound import ZulipInbound
+    from .conversations import ConversationService
+
+    cfg = policy.channel_config("zulip")
+    inbound = ZulipInbound(
+        outbound.client,
+        state_path=Path(data_dir) / ZULIP_STATE_FILE,
+        listen_streams=cfg.get("listen_streams") or [],
+        mention_streams=cfg.get("mention_streams") or [],
+        dm=bool(cfg.get("dm", True)),
+        owned=outbound.owned,
+    )
+    contexts: dict[str, str] = {}
+    context_path = cfg.get("context_prompt")
+    if context_path:
+        try:
+            contexts["zulip"] = Path(context_path).read_text(encoding="utf-8").strip()
+        except OSError as e:
+            logger.warning(f"Zulip context prompt unreadable ({context_path}): {e}")
+    state.conversations = ConversationService(
+        notifications=state.notifications,
+        queue_submit=_submit_to_gtd_queue,
+        sessions_manager=sessions,
+        working_dir=gtd_bot.fixed_working_dir or os.getcwd(),
+        session_store=state.session_store,
+        data_dir=data_dir,
+        ttl_hours=float(cfg.get("session_ttl_hours", 12)),
+        channel_contexts=contexts,
+        inbound_channels={"zulip": inbound},
+    )
+    state.zulip_inbound = inbound
+    state.inbounds.append(inbound)
+    state.inbound_tasks.append(asyncio.create_task(inbound.run(state.conversations.handle)))
+    logger.info(f"Zulip inbound started: listen={sorted(inbound.listen_streams)} "
+                f"mention={len(inbound.mention_streams)} streams dm={inbound.dm}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Setup and teardown."""
@@ -185,9 +232,23 @@ async def lifespan(app: FastAPI):
         if not state.persistent_queue.is_empty:
             logger.info(f"Found {state.persistent_queue.size} items in persistent queue from previous run")
 
+        if "zulip" in outbounds:
+            _start_zulip_inbound(policy, outbounds["zulip"], data_dir, gtd_bot_instance)
+
     yield
 
     # Cleanup
+    for inbound in state.inbounds:
+        inbound.stop()
+    for task in state.inbound_tasks:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    if "zulip" in outbounds:
+        await outbounds["zulip"].client.aclose()
+
     if state.queue_worker_task:
         state.queue_worker_task.cancel()
         try:
@@ -629,16 +690,53 @@ async def _process_email(data: dict, bot: BotConfig):
                                             body=f"❌ Erreur traitement email : `{e}`\nSujet : {subject}"))
 
 
+ZULIP_FALLBACK_DELAY = 120  # seconds the event queue gets before the webhook pipeline steps in
+
+
+def _zulip_pending_dir() -> Path:
+    return Path(settings.gtd_working_dir) / "data" / "zulip-pending"
+
+
+def _purge_seen_zulip_payloads(inbound) -> int:
+    """Drop webhook payloads the Zulip event queue already answered."""
+    removed = 0
+    for path in _zulip_pending_dir().glob("*.json"):
+        if inbound.seen(path.stem):
+            path.unlink(missing_ok=True)
+            removed += 1
+    if removed:
+        logger.info(f"Zulip: purged {removed} webhook payload(s) already handled by the event queue")
+    return removed
+
+
+async def _delayed_zulip_fallback(message_id, bot: BotConfig, delay: float = ZULIP_FALLBACK_DELAY):
+    """Run the webhook pipeline only if the event queue did not pick the message up."""
+    await asyncio.sleep(delay)
+    inbound = state.zulip_inbound
+    if inbound is not None and inbound.seen(message_id):
+        (_zulip_pending_dir() / f"{message_id}.json").unlink(missing_ok=True)
+        return
+    if inbound is not None:
+        try:
+            inbound.mark_seen(message_id)  # the event queue must not answer it a second time
+            inbound.save_state()
+        except (TypeError, ValueError):
+            pass
+    logger.warning(f"Zulip: message {message_id} not seen by the event queue after {delay}s, running pipeline")
+    await _process_pipeline_cron("zulip", bot)
+
+
 @app.post("/webhook/zulip")
 async def webhook_zulip(request: Request):
     """Receive a Zulip outgoing-webhook bot mention or DM.
 
     Zulip times out quickly, so we only persist the payload and return an
     empty body (which tells Zulip to post nothing). The agent's real answer
-    is posted back into the thread by scripts/pipelines/zulip.py.
+    is posted back into the thread by scripts/pipelines/zulip.py — or, when the
+    Zulip event queue runs, by the ConversationService (the webhook is then
+    only a fallback for messages the event queue missed).
     """
     import hmac
-    from .config import settings
 
     try:
         payload = await request.json()
@@ -660,7 +758,12 @@ async def webhook_zulip(request: Request):
         logger.info(f"Zulip webhook: empty message {message_id}, skipping")
         return JSONResponse({})
 
-    pending_dir = Path(settings.gtd_working_dir) / "data" / "zulip-pending"
+    inbound = state.zulip_inbound
+    if inbound is not None and inbound.seen(message_id):
+        logger.info(f"Zulip webhook: message {message_id} already handled by the event queue")
+        return JSONResponse({})
+
+    pending_dir = _zulip_pending_dir()
     pending_dir.mkdir(parents=True, exist_ok=True)
     (pending_dir / f"{message_id}.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2)
@@ -672,7 +775,11 @@ async def webhook_zulip(request: Request):
         logger.error("Zulip webhook: GTD bot not configured")
         return JSONResponse({"error": "GTD bot not configured"}, status_code=500)
 
-    asyncio.create_task(_process_pipeline_cron("zulip", gtd_bot))
+    if inbound is not None:
+        # The event queue normally answers first; the pipeline only catches what it missed.
+        asyncio.create_task(_delayed_zulip_fallback(message_id, gtd_bot))
+    else:
+        asyncio.create_task(_process_pipeline_cron("zulip", gtd_bot))
 
     # Empty object = "bot has nothing to say right now".
     return JSONResponse({})
@@ -898,6 +1005,8 @@ async def cron_reminder(reminder_type: str):
 
     # Pipeline-enabled crons bypass Claude CLI + MCP entirely
     if reminder_type in PIPELINE_CRONS:
+        if reminder_type == "zulip" and state.zulip_inbound is not None:
+            _purge_seen_zulip_payloads(state.zulip_inbound)
         asyncio.create_task(_process_pipeline_cron(reminder_type, gtd_bot))
         return {"status": "accepted", "type": reminder_type, "mode": "pipeline"}
 

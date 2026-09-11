@@ -31,6 +31,8 @@ notifications: "NotificationService | None" = None
 conversations: Any = None   # ConversationService, once a non-Telegram inbound channel runs
 session_store: Any = None   # SessionStore for non-Telegram conversations
 inbounds: list[Any] = []    # running InboundChannel instances
+inbound_tasks: list[Any] = []  # asyncio tasks running InboundChannel.run
+zulip_inbound: Any = None   # ZulipInbound when the Zulip event queue runs (webhook becomes a fallback)
 
 # Telegram UI state
 pending_permissions: dict[str, dict] = {}  # chat_id -> {message, denials, session_key, bot_name}

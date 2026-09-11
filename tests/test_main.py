@@ -528,3 +528,106 @@ def test_channels_inject_publishes_event():
     assert response.status_code == 200
     [event] = fake.events
     assert (event.type, event.severity, event.title, event.body) == ("test", "normal", "Cron: test", "Test étape 1")
+
+
+class FakeInbound:
+    def __init__(self, seen=()):
+        self._seen = {int(i) for i in seen}
+        self.saved = 0
+
+    def seen(self, message_id):
+        try:
+            return int(message_id) in self._seen
+        except (TypeError, ValueError):
+            return False
+
+    def mark_seen(self, message_id):
+        self._seen.add(int(message_id))
+
+    def save_state(self):
+        self.saved += 1
+
+
+def _zulip_post(tmp_path, message_id, inbound):
+    from claude_telegram import main
+
+    gtd = BotConfig(name="gtd", token="t", chat_id="999", use_queue=True)
+    pipeline, fallback = AsyncMock(), AsyncMock()
+    with patch.dict("os.environ", {"ZULIP_WEBHOOK_TOKEN": "tok"}), \
+            patch.object(main.settings, "gtd_working_dir", str(tmp_path)), \
+            patch.object(state, "bots", {"gtd": gtd}), patch.object(state, "zulip_inbound", inbound), \
+            patch.object(main, "_process_pipeline_cron", pipeline), \
+            patch.object(main, "_delayed_zulip_fallback", fallback):
+        response = client.post("/webhook/zulip", json={
+            "token": "tok", "data": "@**Agent** salut",
+            "message": {"id": message_id, "content": "@**Agent** salut", "sender_email": "a@b"}})
+    return response, pipeline, fallback
+
+
+def test_zulip_webhook_ignores_message_already_seen_by_inbound(tmp_path):
+    response, pipeline, fallback = _zulip_post(tmp_path, 42, FakeInbound(seen=[42]))
+    assert response.json() == {}
+    assert not (tmp_path / "data" / "zulip-pending" / "42.json").exists()
+    pipeline.assert_not_called()
+    fallback.assert_not_called()
+
+
+def test_zulip_webhook_defers_to_inbound_with_delayed_fallback(tmp_path):
+    response, pipeline, fallback = _zulip_post(tmp_path, 43, FakeInbound())
+    assert response.json() == {}
+    assert (tmp_path / "data" / "zulip-pending" / "43.json").exists()
+    pipeline.assert_not_called()
+    assert fallback.call_args.args[0] == 43
+
+
+def test_zulip_webhook_without_inbound_runs_pipeline(tmp_path):
+    response, pipeline, fallback = _zulip_post(tmp_path, 44, None)
+    assert (tmp_path / "data" / "zulip-pending" / "44.json").exists()
+    assert pipeline.call_args.args[0] == "zulip"
+    fallback.assert_not_called()
+
+
+def _fallback_run(tmp_path, message_id, inbound):
+    import asyncio
+    from claude_telegram import main
+
+    pending = tmp_path / "data" / "zulip-pending"
+    pending.mkdir(parents=True)
+    (pending / f"{message_id}.json").write_text("{}")
+    gtd = BotConfig(name="gtd", token="t", chat_id="999", use_queue=True)
+    pipeline = AsyncMock()
+    with patch.object(main.settings, "gtd_working_dir", str(tmp_path)), \
+            patch.object(state, "zulip_inbound", inbound), patch.object(main, "_process_pipeline_cron", pipeline):
+        asyncio.run(main._delayed_zulip_fallback(message_id, gtd, delay=0))
+    return pending / f"{message_id}.json", pipeline
+
+
+def test_delayed_fallback_drops_payload_handled_by_inbound(tmp_path):
+    path, pipeline = _fallback_run(tmp_path, 50, FakeInbound(seen=[50]))
+    assert not path.exists()
+    pipeline.assert_not_called()
+
+
+def test_delayed_fallback_runs_pipeline_when_inbound_missed_it(tmp_path):
+    inbound = FakeInbound()
+    path, pipeline = _fallback_run(tmp_path, 51, inbound)
+    assert pipeline.call_args.args[0] == "zulip"
+    assert inbound.seen(51) and inbound.saved == 1
+
+
+def test_cron_zulip_purges_payloads_seen_by_inbound(tmp_path):
+    from claude_telegram import main
+
+    pending = tmp_path / "data" / "zulip-pending"
+    pending.mkdir(parents=True)
+    (pending / "60.json").write_text("{}")
+    (pending / "61.json").write_text("{}")
+    gtd = BotConfig(name="gtd", token="t", chat_id="999", use_queue=True)
+    pipeline = AsyncMock()
+    with patch.object(main.settings, "gtd_working_dir", str(tmp_path)), \
+            patch.object(state, "bots", {"gtd": gtd}), patch.object(state, "zulip_inbound", FakeInbound(seen=[60])), \
+            patch.object(main, "_process_pipeline_cron", pipeline):
+        response = client.post("/cron/zulip")
+    assert response.json()["mode"] == "pipeline"
+    assert not (pending / "60.json").exists() and (pending / "61.json").exists()
+    assert pipeline.call_args.args[0] == "zulip"
