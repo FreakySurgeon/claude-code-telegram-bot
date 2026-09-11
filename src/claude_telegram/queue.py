@@ -327,6 +327,35 @@ def _silent_event(item: QueueItem, text: str) -> Event | None:
     return None
 
 
+async def _rename_default_topic(notifications, ref: ConversationRef, item: QueueItem, text: str,
+                                session_store=None) -> ConversationRef:
+    """Give a default topic ("(no topic)", "general chat"…) a real title after the first answer.
+
+    Uses the ``<!-- title: … -->`` marker of the response, else a generated
+    title. Only outbounds exposing ``default_topic_names`` (Zulip) qualify.
+    """
+    outbound = notifications.outbound(ref.channel) if hasattr(notifications, "outbound") else None
+    defaults = getattr(outbound, "default_topic_names", None)
+    if outbound is None or ref.topic is None or not defaults or ref.topic.lower() not in defaults:
+        return ref
+    from .topic import extract_title_from_response, generate_title_fallback
+    _, title = extract_title_from_response(text)
+    if not title:
+        question = item.prompt.split("\n", 1)[-1] if item.prompt.startswith("[") else item.prompt
+        title = await generate_title_fallback(question, text)
+    try:
+        new_ref = await outbound.rename_conversation(ref, title)
+    except Exception:  # noqa: BLE001 — renaming is cosmetic
+        logger.warning("Topic rename failed for %s", ref.key, exc_info=True)
+        return ref
+    if new_ref is None or new_ref == ref:
+        return ref
+    logger.info("Renamed %s -> %s", ref.key, new_ref.key)
+    if session_store is not None:
+        session_store.move(ref.key, new_ref.key)
+    return new_ref
+
+
 async def process_queue_item(
     item: QueueItem,
     runner,  # ClaudeRunner
@@ -487,6 +516,8 @@ async def process_queue_item(
             logger.info(f"Cron {reminder_type or '?'} produced no output, skipping notification")
 
         # Non-Telegram conversations keep their Claude session across restarts
+        if ref is not None and ref.channel != "telegram" and not silent and result.text:
+            ref = await _rename_default_topic(notifications, ref, item, result.text, session_store)
         if ref is not None and ref.channel != "telegram" and session_store is not None:
             session_store.save(ref.key, result.session_id or getattr(runner, "session_id", None))
 

@@ -502,3 +502,48 @@ def test_persistent_queue_roundtrip_with_conversation(pqueue):
     assert item.conversation == ref
     assert item.event_type == "conversation" and item.channel_context == "ctx"
     assert item.ref_or_legacy() == ref
+
+
+class FakeTopicOutbound:
+    default_topic_names = {"", "(no topic)", "general chat"}
+
+    def __init__(self):
+        self.renamed = []
+
+    async def rename_conversation(self, ref, title):
+        self.renamed.append((ref, title))
+        return ref.with_topic(title)
+
+
+@pytest.mark.asyncio
+async def test_default_topic_renamed_from_title_marker(mock_bot, clear_provider_state):
+    ref = ConversationRef("zulip", "stream:quotidien", topic="(no topic)")
+    item = QueueItem(prompt="[zulip · #quotidien › (no topic) · de Thomas]\nOn fait les courses ?",
+                     source="zulip", conversation=ref)
+    runner = _runner(ClaudeResult(text="Oui.\n<!-- title: Courses samedi -->", session_id="s2",
+                                  permission_denials=[]))
+    notifications, store = FakeNotifications(), FakeSessionStore()
+    store.move = MagicMock()
+    out = FakeTopicOutbound()
+    notifications.outbound = lambda channel: out
+
+    await process_queue_item(item, runner, mock_bot, notifications=notifications, session_store=store)
+
+    assert out.renamed == [(ref, "Courses samedi")]
+    new_key = ref.with_topic("Courses samedi").key
+    store.move.assert_called_once_with(ref.key, new_key)
+    assert store.saved == {new_key: "s2"}
+
+
+@pytest.mark.asyncio
+async def test_named_topic_not_renamed(mock_bot, clear_provider_state):
+    ref = ConversationRef("zulip", "stream:quotidien", topic="Courses")
+    item = QueueItem(prompt="x", source="zulip", conversation=ref)
+    runner = _runner(ClaudeResult(text="Oui.\n<!-- title: Autre -->", permission_denials=[]))
+    notifications = FakeNotifications()
+    out = FakeTopicOutbound()
+    notifications.outbound = lambda channel: out
+
+    await process_queue_item(item, runner, mock_bot, notifications=notifications)
+
+    assert out.renamed == []
