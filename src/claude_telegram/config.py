@@ -54,6 +54,14 @@ class Settings(BaseSettings):
     # Metrics
     cron_token_alert_threshold: int = 100_000  # Alert if cron uses more tokens
 
+    # LLM fallback chain (Claude -> DeepSeek via the Anthropic-compatible endpoint)
+    llm_interactive_chain: str = "claude,deepseek"
+    llm_provider_state_path: str | None = None  # Shared cooldown file (default: data/llm-provider-state.json)
+    deepseek_api_key_file: str | None = None  # Key is read at runtime, never stored in .env
+    deepseek_base_url: str = "https://api.deepseek.com/anthropic"
+    deepseek_model: str = "deepseek-v4-flash"
+    claude_slim_config_dir: str | None = None  # CLAUDE_CONFIG_DIR for DeepSeek runs
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     def get_favorite_repos(self) -> list[str]:

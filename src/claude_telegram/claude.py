@@ -37,6 +37,9 @@ class ClaudeResult:
     cache_read_tokens: int = 0
     num_turns: int = 0
     duration_api_ms: int = 0
+    # LLM fallback chain (see providers.py)
+    failure_kind: str | None = None
+    provider: str = "claude"
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +375,7 @@ class ClaudeRunner:
         system_prompt: str | None = None,
         mcp_config: str | None = None,
         timeout: float = 600,
+        provider_env: dict[str, str | None] | None = None,
     ) -> ClaudeResult:
         """
         Run Claude Code with a message.
@@ -387,6 +391,7 @@ class ClaudeRunner:
             system_prompt: Optional system prompt to append (e.g., GTD bot)
             mcp_config: Optional path to MCP config file
             timeout: Timeout in seconds (default 600s / 10 minutes)
+            provider_env: Env overrides for the LLM provider (None value removes the variable)
 
         Returns:
             ClaudeResult with response text and any permission denials
@@ -447,6 +452,11 @@ class ClaudeRunner:
         # Set environment variable to prevent hook from sending duplicate notifications
         env = os.environ.copy()
         env["CLAUDE_TELEGRAM_BOT"] = "1"
+        for key, value in (provider_env or {}).items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
 
         self.current_process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -506,7 +516,7 @@ class ClaudeRunner:
                     result_text = event.get("result", "")
                     result_session_id = event.get("session_id")
                     # Extract metrics from result event
-                    result_cost_usd = event.get("cost_usd")
+                    result_cost_usd = event.get("total_cost_usd", event.get("cost_usd"))
                     result_num_turns = event.get("num_turns", 0)
                     result_duration_api_ms = event.get("duration_api_ms", 0)
                     usage = event.get("usage") or {}
@@ -598,6 +608,12 @@ class ClaudeRunner:
         # is_quota_error only when the request actually failed:
         # either no result, or process exited with error code
         failed = not has_result or (returncode is not None and returncode != 0)
+        failure_kind = None
+        if failed:
+            from .providers import classify_failure
+            failure_kind = classify_failure(returncode, response_text, error_message or "").value
+            if is_quota and failure_kind != "auth":
+                failure_kind = "quota"
         return ClaudeResult(
             text=response_text,
             permission_denials=permission_denials,
@@ -611,6 +627,7 @@ class ClaudeRunner:
             cache_read_tokens=result_cache_read_tokens,
             num_turns=result_num_turns,
             duration_api_ms=result_duration_api_ms,
+            failure_kind=failure_kind,
         )
 
     async def _force_kill(self):

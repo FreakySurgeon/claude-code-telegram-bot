@@ -19,6 +19,15 @@ os.environ.setdefault("MISTRAL_API_KEY", "")
 os.environ.setdefault("WEBHOOK_SECRET", "")
 
 
+@pytest.fixture(autouse=True)
+def _isolated_llm_provider_state(tmp_path, monkeypatch):
+    """Never read/write the real provider-state file nor the real DeepSeek key."""
+    from claude_telegram.config import settings
+    monkeypatch.setattr(settings, "llm_provider_state_path", str(tmp_path / "llm-provider-state.json"))
+    monkeypatch.setattr(settings, "deepseek_api_key_file", None)
+    monkeypatch.setattr(settings, "claude_slim_config_dir", None)
+
+
 @pytest.fixture
 def mock_settings():
     """Mock settings for testing."""
