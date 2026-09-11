@@ -358,7 +358,9 @@ async def test_full_unavailability_and_recovery_flow(mock_bot, tmp_path):
     assert status.unavailable is True
     assert pqueue.size == 1
 
-    # Phase 2: API recovers — a new message succeeds
+    # Phase 2: API recovers — the provider cooldown has expired, a new message succeeds
+    from claude_telegram.providers import ProviderState, state_path
+    ProviderState(state_path()).clear("claude")
     mock_runner.run = AsyncMock(return_value=ClaudeResult(text="I'm back!", permission_denials=[]))
     item2 = QueueItem(prompt="New message", source="telegram", chat_id="12345")
 

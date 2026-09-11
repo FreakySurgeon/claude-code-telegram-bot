@@ -1510,8 +1510,11 @@ async def run_claude(
         )
 
     try:
-        result = await runner.run(
+        from .providers import run_with_fallback, telegram_notifier
+        result = await run_with_fallback(
+            runner,
             message,
+            notify=telegram_notifier(bot),
             continue_session=continue_session,
             new_session=new_session,
             allowed_tools=allowed_tools,

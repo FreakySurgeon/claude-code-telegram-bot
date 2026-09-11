@@ -25,6 +25,8 @@ def write_metric(
     session_id: str | None,
     cache_creation_tokens: int = 0,
     cache_read_tokens: int = 0,
+    provider: str = "claude",
+    failure_kind: str | None = None,
 ) -> None:
     """Append a metric line to the JSONL log."""
     entry = {
@@ -42,6 +44,8 @@ def write_metric(
         "duration_api_ms": duration_api_ms,
         "status": status,
         "session_id": session_id,
+        "provider": provider,
+        "failure_kind": failure_kind,
     }
     try:
         METRICS_FILE.parent.mkdir(parents=True, exist_ok=True)

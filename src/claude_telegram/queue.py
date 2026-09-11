@@ -303,8 +303,11 @@ async def process_queue_item(
         logger.info(f"Processing queue item: source={item.source}, model={item.model or 'default'}, "
                      f"timeout={item.timeout}s, metadata={item.metadata}")
         _run_start = time.monotonic()
-        result = await runner.run(
+        from .providers import run_with_fallback, telegram_notifier
+        result = await run_with_fallback(
+            runner,
             item.prompt,
+            notify=telegram_notifier(bot),
             model=item.model,
             continue_session=item.continue_session,
             new_session=item.new_session,
@@ -379,6 +382,8 @@ async def process_queue_item(
             duration_api_ms=result.duration_api_ms,
             status="ok",
             session_id=result.session_id,
+            provider=result.provider,
+            failure_kind=result.failure_kind,
         )
 
         # --- Token alert for crons ---
