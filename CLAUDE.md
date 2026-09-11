@@ -29,6 +29,30 @@ Unified Telegram bot for Claude Code Remote + GTD Assistant.
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+## Channels (ports & adapters)
+
+Core modules are channel-agnostic: `ports.py` (ConversationRef, InboundMessage,
+Event, Action), `routing.py` (RoutingPolicy), `notifications.py`
+(NotificationService), `conversations.py` (ConversationService). Adapters live
+in `adapters/telegram/` and `adapters/zulip/`; `main.py` is the composition root.
+
+**Rule**: no Telegram import outside `adapters/`. Check with
+`grep -rn "import telegram\|from .telegram\|from . import telegram" src/claude_telegram/*.py`
+(must be empty).
+
+- Routing comes from the `channels:` block of `CHANNEL_ROUTING_PATH` (template:
+  `routing.example.yaml`); `${VAR}` expanded from env + `CHANNEL_ENV_FILE`.
+  Unset = everything to Telegram (legacy behaviour).
+- Crons/webhooks/`/notify/{event_type}` publish an `Event`; severity `urgent`
+  → `urgent` list, else `default`; `only_severity` filters per channel;
+  `dev.*` events → dev bot.
+- Zulip inbound = event-queue long-poll (cursor `$DATA_DIR/zulip-events.json`),
+  one topic = one Claude session (`$DATA_DIR/channel-sessions.json`, TTL).
+- `POST /webhook/zulip` = safety net: when the inbound runs, a payload is
+  processed only if the queue did not see the message within 120 s.
+- `POST /channels/inject` (loopback + `X-Webhook-Secret`) = local test hook
+  for events and inbound messages.
+
 ## Service
 
 ```bash
@@ -172,7 +196,9 @@ claude-code-telegram-bot/
 │   ├── main.py          # FastAPI, dual polling, endpoints
 │   ├── config.py        # Settings (dev + gtd + transcription)
 │   ├── bots.py          # BotConfig dataclass, create_bots()
-│   ├── telegram.py      # Telegram API (multi-token via api_url)
+│   ├── ports.py / routing.py / notifications.py / conversations.py  # channel core
+│   ├── adapters/telegram/  # Telegram API, handlers, outbound
+│   ├── adapters/zulip/     # Zulip client, inbound (event queue), outbound
 │   ├── claude.py        # ClaudeRunner (system_prompt, mcp_config)
 │   ├── transcribe.py    # Whisper + Voxtral
 │   ├── tunnel.py        # Cloudflare tunnel

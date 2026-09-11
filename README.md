@@ -235,6 +235,28 @@ Bot: 📂 Switched to api
 | `HOST` | `0.0.0.0` | Server host |
 | `PORT` | `8000` | Server port |
 | `WEBHOOK_URL` | (none) | Your public URL (webhook mode only) |
+| `CHANNEL_ROUTING_PATH` | (none) | YAML file with a `channels:` block (see `routing.example.yaml`). Unset = everything goes to Telegram |
+| `CHANNEL_ENV_FILE` | (none) | Optional dotenv file used to expand `${VAR}` placeholders in the routing file |
+
+## Channels (ports & adapters)
+
+The core (`ports.py`, `routing.py`, `notifications.py`, `conversations.py`) is
+channel-agnostic; Telegram and Zulip are adapters under `adapters/`. No module
+outside `adapters/` imports Telegram code.
+
+- **Outbound**: crons, webhooks and `/notify/{event_type}` build an `Event`
+  (type, severity, title, body). The `RoutingPolicy` sends `urgent` events to
+  every channel listed in `urgent` and the rest to `default`; a channel's
+  `only_severity` drops everything else for that channel.
+- **Inbound (Zulip)**: an event-queue long-poll listens to `listen_streams`
+  (every message), `mention_streams` (on @mention) and DMs. One topic = one
+  Claude session (idle TTL `session_ttl_hours`). The event cursor is stored in
+  `$DATA_DIR/zulip-events.json`.
+- **Webhook fallback**: `POST /webhook/zulip` (Zulip outgoing webhook) is kept
+  as a safety net. When the event queue runs, a payload is only processed if
+  the queue has not seen the message after 2 minutes.
+- **Local testing**: `POST /channels/inject` (loopback + `X-Webhook-Secret`)
+  publishes an `Event` or feeds an inbound message through the core.
 
 ## Docker
 
@@ -317,9 +339,15 @@ uv run uvicorn claude_telegram.main:app --reload
 ```
 claude-telegram/
 ├── src/claude_telegram/
-│   ├── main.py          # FastAPI app, webhook/polling handlers
+│   ├── main.py          # FastAPI app (composition root, endpoints)
 │   ├── config.py        # Pydantic settings
-│   ├── telegram.py      # Telegram API client
+│   ├── ports.py         # Channel-agnostic types (Event, InboundMessage, ...)
+│   ├── routing.py       # RoutingPolicy (channels: block)
+│   ├── notifications.py # NotificationService (publish/reply)
+│   ├── conversations.py # ConversationService (inbound → Claude session)
+│   ├── adapters/
+│   │   ├── telegram/    # Telegram API, handlers, outbound
+│   │   └── zulip/       # Zulip client, event-queue inbound, outbound
 │   ├── claude.py        # Claude CLI runner
 │   ├── tunnel.py        # Cloudflare Tunnel manager
 │   └── markdown.py      # MD → Telegram HTML
