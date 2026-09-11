@@ -53,6 +53,20 @@ def event_type_for(reminder_type: str) -> str:
     return PIPELINE_EVENT_TYPES.get(reminder_type, reminder_type.replace("-", "_"))
 
 
+_SEVERITY_RE = re.compile(r"<!--\s*severity:\s*(urgent|normal|info)\s*-->\s*", re.IGNORECASE)
+
+
+def parse_severity(output: str, default: str = "normal") -> tuple[str, str]:
+    """Extract a ``<!-- severity: urgent|normal|info -->`` marker from pipeline output.
+
+    Returns the output without the marker and the severity (``default`` when absent).
+    """
+    match = _SEVERITY_RE.search(output or "")
+    if not match:
+        return output, default
+    return (output[:match.start()] + output[match.end():]).strip(), match.group(1).lower()
+
+
 @dataclass(frozen=True)
 class ChannelRef:
     """A channel plus a channel-specific target (stream/topic, bot, …)."""

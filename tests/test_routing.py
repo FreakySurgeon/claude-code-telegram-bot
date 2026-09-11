@@ -106,3 +106,19 @@ def test_example_file_parses():
     p = RoutingPolicy.from_file(Path(__file__).parent.parent / "routing.example.yaml")
     assert p.route(Event("briefing_morning", "normal"))[0].channel == "zulip"
     assert [c.channel for c in p.route(Event("x", "urgent"))] == ["telegram", "zulip"]
+
+
+def test_parse_severity_strips_marker():
+    from claude_telegram.routing import parse_severity
+
+    assert parse_severity("<!-- severity: urgent -->\nFuite d'eau", "normal") == ("Fuite d'eau", "urgent")
+    assert parse_severity("Rien de spécial", "normal") == ("Rien de spécial", "normal")
+    assert parse_severity("Texte\n<!-- severity: INFO -->", "normal") == ("Texte", "info")
+
+
+def test_event_type_for_pipelines():
+    from claude_telegram.routing import event_type_for
+
+    assert event_type_for("morning") == "briefing_morning"
+    assert event_type_for("zulip") == "zulip_fallback"
+    assert event_type_for("new-thing") == "new_thing"

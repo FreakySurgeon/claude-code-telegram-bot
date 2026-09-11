@@ -1,5 +1,7 @@
 """Configuration settings."""
 
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
 
 
@@ -62,7 +64,20 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-v4-flash"
     claude_slim_config_dir: str | None = None  # CLAUDE_CONFIG_DIR for DeepSeek runs
 
+    # Channels (ports & adapters): routing file + dotenv used to expand ${VAR} in it
+    channel_routing_path: str | None = None
+    channel_env_file: str | None = None
+    data_dir: str | None = None  # Runtime state (default: $GTD_WORKING_DIR/data)
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+
+    @property
+    def resolved_data_dir(self) -> Path:
+        if self.data_dir:
+            return Path(self.data_dir).expanduser()
+        if self.gtd_working_dir:
+            return Path(self.gtd_working_dir).expanduser() / "data"
+        return Path("data")
 
     def get_favorite_repos(self) -> list[str]:
         """Parse favorite repos from comma-separated string."""
