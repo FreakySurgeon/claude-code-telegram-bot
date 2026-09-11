@@ -6,6 +6,48 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from claude_telegram.queue import QueueItem, RequestQueue, process_queue_item, PersistentQueue, ApiStatus
 from claude_telegram.claude import ClaudeResult
+from claude_telegram.ports import ConversationRef
+
+
+class FakeNotifications:
+    """Records what process_queue_item asks the NotificationService to do."""
+
+    def __init__(self):
+        self.replies = []      # (ref, text)
+        self.published = []    # Event
+        self.started = []      # (ref, kwargs)
+        self.stopped = []      # (handle, ok)
+
+    async def reply(self, ref, text, **kwargs):
+        self.replies.append((ref, text))
+
+    async def publish(self, event):
+        self.published.append(event)
+
+    async def start_progress(self, ref, **kwargs):
+        self.started.append((ref, kwargs))
+        return ("progress", ref.key)
+
+    async def stop_progress(self, handle, ok=True):
+        if handle is not None:
+            self.stopped.append((handle, ok))
+
+
+class FakeSessionStore:
+    def __init__(self):
+        self.saved = {}
+
+    def save(self, key, session_id):
+        self.saved[key] = session_id
+
+
+def _runner(result):
+    runner = MagicMock()
+    runner.run = AsyncMock(return_value=result)
+    runner.short_name = "gtd"
+    runner.session_id = None
+    runner.working_dir = "/tmp"
+    return runner
 
 
 @pytest.fixture
@@ -294,19 +336,16 @@ async def test_process_queue_item_quota_error_persists(mock_bot, tmp_path):
     ))
     mock_runner.short_name = "gtd"
 
-    with patch("claude_telegram.adapters.telegram.api.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}) as mock_send, \
-         patch("claude_telegram.adapters.telegram.api.delete_message", new_callable=AsyncMock), \
-         patch("claude_telegram.adapters.telegram.outbound.send_response", new_callable=AsyncMock), \
-         patch("claude_telegram.adapters.telegram.outbound.animate_status", new_callable=AsyncMock), \
-         patch("claude_telegram.adapters.telegram.outbound.get_thinking_message", return_value="✨"):
-        await process_queue_item(item, mock_runner, mock_bot,
-                                 persistent_queue=pqueue, api_status=api_status)
+    notifications = FakeNotifications()
+    await process_queue_item(item, mock_runner, mock_bot, persistent_queue=pqueue,
+                             api_status=api_status, notifications=notifications)
 
     assert api_status.unavailable is True
     assert pqueue.size == 1
-    # Should have sent the first-detection notification
-    calls = [str(c) for c in mock_send.call_args_list]
-    assert any("épuisés" in c for c in calls)
+    # First detection: an urgent event, plus the per-message queue notice in the conversation
+    assert any(e.severity == "urgent" and "épuisés" in e.body for e in notifications.published)
+    assert any("file d'attente" in text for _, text in notifications.replies)
+    assert notifications.stopped == [(("progress", "telegram:12345:"), False)]
 
 
 @pytest.mark.asyncio
@@ -378,3 +417,88 @@ async def test_full_unavailability_and_recovery_flow(mock_bot, tmp_path):
     mock_send.assert_called()
     # Note: persistent queue items are replayed by queue_worker, not by process_queue_item.
     # The queue still has 1 item (the persisted one), but api_status is cleared.
+
+
+@pytest.fixture
+def clear_provider_state():
+    from claude_telegram.providers import ProviderState, state_path
+    ProviderState(state_path()).clear("claude")
+    yield
+
+
+@pytest.mark.asyncio
+async def test_zulip_item_replies_on_its_conversation(mock_bot, clear_provider_state):
+    ref = ConversationRef("zulip", "stream:quotidien", topic="Test canal")
+    item = QueueItem(prompt="Salut", source="zulip", conversation=ref,
+                     metadata={"inbound_message_id": "42"}, channel_context="Canal : Zulip")
+    runner = _runner(ClaudeResult(text="Bonjour !", session_id="sess-1", permission_denials=[]))
+    notifications, store = FakeNotifications(), FakeSessionStore()
+
+    await process_queue_item(item, runner, mock_bot, notifications=notifications, session_store=store)
+
+    assert notifications.replies == [(ref, "Bonjour !")]
+    assert notifications.started[0][0] == ref
+    assert notifications.started[0][1]["inbound_message_id"] == "42"
+    assert notifications.stopped == [(("progress", ref.key), True)]
+    assert store.saved == {ref.key: "sess-1"}
+    assert "Canal : Zulip" in runner.run.call_args.kwargs["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_email_urgent_publishes_urgent_event(mock_bot, clear_provider_state):
+    item = QueueItem(prompt="triage", source="email", metadata={"subject": "Impôts"})
+    runner = _runner(ClaudeResult(text="Label : Claude/Urgent — payer avant ce soir", permission_denials=[]))
+    notifications = FakeNotifications()
+
+    await process_queue_item(item, runner, mock_bot, notifications=notifications)
+
+    assert notifications.started == [] and notifications.replies == []
+    [event] = notifications.published
+    assert event.type == "email_triage" and event.severity == "urgent"
+    assert event.title == "Email: Impôts"
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_scan_ok_publishes_nothing(mock_bot, clear_provider_state):
+    item = QueueItem(prompt="scan", source="cron", metadata={"reminder_type": "whatsapp"})
+    runner = _runner(ClaudeResult(text="OK", permission_denials=[]))
+    notifications = FakeNotifications()
+
+    await process_queue_item(item, runner, mock_bot, notifications=notifications)
+
+    assert notifications.published == [] and notifications.replies == [] and notifications.started == []
+
+
+@pytest.mark.asyncio
+async def test_long_scan_result_publishes_typed_event(mock_bot, clear_provider_state):
+    item = QueueItem(prompt="scan", source="cron", metadata={"reminder_type": "gdrive-inbox"})
+    runner = _runner(ClaudeResult(text="x" * 300, permission_denials=[]))
+    notifications = FakeNotifications()
+
+    await process_queue_item(item, runner, mock_bot, notifications=notifications)
+
+    [event] = notifications.published
+    assert event.type == "gdrive_inbox" and event.severity == "normal"
+
+
+@pytest.mark.asyncio
+async def test_legacy_item_replies_on_telegram_ref(mock_bot, clear_provider_state):
+    item = QueueItem(prompt="Salut", source="telegram", chat_id="12345", thread_id=7)
+    runner = _runner(ClaudeResult(text="Réponse", permission_denials=[]))
+    notifications = FakeNotifications()
+
+    await process_queue_item(item, runner, mock_bot, notifications=notifications)
+
+    [(ref, text)] = notifications.replies
+    assert ref == ConversationRef("telegram", "12345", thread_id=7, bot="gtd")
+    assert text == "Réponse"
+
+
+def test_persistent_queue_roundtrip_with_conversation(pqueue):
+    ref = ConversationRef("zulip", "dm:thomas@example.com")
+    pqueue.save(QueueItem(prompt="Hi", source="zulip", conversation=ref,
+                          event_type="conversation", channel_context="ctx"))
+    [item] = pqueue.list_items()
+    assert item.conversation == ref
+    assert item.event_type == "conversation" and item.channel_context == "ctx"
+    assert item.ref_or_legacy() == ref

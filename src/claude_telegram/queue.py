@@ -11,6 +11,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+from .ports import ConversationRef, Event
+from .routing import event_type_for
+
 logger = logging.getLogger(__name__)
 
 RETRY_PREFIX = (
@@ -55,8 +58,8 @@ def _write_dead_letter(item: "QueueItem", error: str) -> None:
 class QueueItem:
     """A request queued for Claude processing."""
     prompt: str
-    source: Literal["telegram", "email", "cron"]
-    chat_id: str
+    source: Literal["telegram", "email", "cron", "zulip", "fitness", "calendar"] | str
+    chat_id: str | None = None  # Telegram legacy; other channels use `conversation`
     # Optional metadata
     metadata: dict = field(default_factory=dict)
     model: str | None = None
@@ -69,6 +72,21 @@ class QueueItem:
     retry_count: int = 0
     original_error: str | None = None
     thread_id: int | None = None
+    # Channel-independent routing (set by producers; None = legacy Telegram fields)
+    conversation: ConversationRef | None = None
+    event_type: str | None = None
+    channel_context: str | None = None
+
+    def ref_or_legacy(self, bot_name: str | None = "gtd") -> ConversationRef | None:
+        """Where replies go: the conversation, else the legacy Telegram chat/thread.
+
+        Emails have no conversation until something is worth notifying.
+        """
+        if self.conversation is not None:
+            return self.conversation
+        if self.source == "email" or not self.chat_id:
+            return None
+        return ConversationRef("telegram", str(self.chat_id), thread_id=self.thread_id, bot=bot_name)
 
     @property
     def can_retry(self) -> bool:
@@ -90,6 +108,9 @@ class QueueItem:
             retry_count=self.retry_count + 1,
             original_error=error,
             thread_id=self.thread_id,
+            conversation=self.conversation,
+            event_type=self.event_type,
+            channel_context=self.channel_context,
         )
 
 
@@ -172,6 +193,9 @@ class PersistentQueue:
             "allowed_tools": item.allowed_tools,
             "timeout": item.timeout,
             "thread_id": item.thread_id,
+            "conversation": item.conversation.to_dict() if item.conversation else None,
+            "event_type": item.event_type,
+            "channel_context": item.channel_context,
             "queued_at": datetime.now().isoformat(),
         }
 
@@ -205,9 +229,12 @@ class PersistentQueue:
                     allowed_tools=data.get("allowed_tools"),
                     timeout=data.get("timeout", 600),
                     thread_id=data.get("thread_id"),
+                    conversation=ConversationRef.from_dict(data["conversation"]) if data.get("conversation") else None,
+                    event_type=data.get("event_type"),
+                    channel_context=data.get("channel_context"),
                 )
                 result.append((item, f))
-            except (json.JSONDecodeError, KeyError) as e:
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
                 logger.warning(f"Skipping corrupt queue file {f}: {e}")
         return result
 
@@ -251,6 +278,55 @@ class ApiStatus:
         self.last_error = None
 
 
+SCAN_TYPES = ("whatsapp", "gdrive-inbox", "sent-emails")
+
+
+def _default_notifications(bot):
+    """NotificationService used when none is wired (tests, early startup): Telegram only."""
+    from . import state
+    if state.notifications is not None:
+        return state.notifications
+    from .adapters.telegram.outbound import TelegramOutbound
+    from .notifications import NotificationService
+    from .routing import RoutingPolicy
+    return NotificationService(RoutingPolicy.default(), {"telegram": TelegramOutbound({bot.name: bot})})
+
+
+def _event_notifier(notifications):
+    """LLM-provider alerts (fallback chain) published as ``llm_provider`` events."""
+    async def _notify(text: str, severity: str) -> None:
+        sev = severity if severity in ("urgent", "normal", "info") else "normal"
+        prefix = "🚨 " if sev == "urgent" else ""
+        await notifications.publish(Event("llm_provider", sev, body=prefix + text))
+    return _notify
+
+
+def _silent_event(item: QueueItem, text: str) -> Event | None:
+    """Event for a silent source (email triage, periodic scans), or None to stay quiet.
+
+    Same thresholds as the historical Telegram behaviour.
+    """
+    reminder_type = item.metadata.get("reminder_type", "")
+    text = text or ""
+    if reminder_type in SCAN_TYPES:
+        stripped = text.strip()
+        if stripped and stripped.upper() != "OK" and len(stripped) > 200:
+            return Event(item.event_type or event_type_for(reminder_type), "normal", body=text)
+        return None
+    subject = item.metadata.get("subject", "(no subject)")
+    title = f"Email: {subject[:60]}"
+    event_type = item.event_type or "email_triage"
+    if "Claude/Urgent" in text:
+        return Event(event_type, "urgent", title=title, body=text)
+    if "Claude/Action" in text or "Claude/Brouillon" in text:
+        return Event(event_type, "normal", title=title, body=text)
+    if text and "Claude/Info" not in text and len(text) > 150:
+        # Agent did work (long response) but forgot the label string: notify rather than drop
+        logger.warning(f"Email triage fallback notification (no label in text, len={len(text)}): {subject}")
+        return Event(event_type, "normal", title=title, body=text)
+    return None
+
+
 async def process_queue_item(
     item: QueueItem,
     runner,  # ClaudeRunner
@@ -258,62 +334,58 @@ async def process_queue_item(
     queue: "RequestQueue | None" = None,
     persistent_queue: "PersistentQueue | None" = None,
     api_status: "ApiStatus | None" = None,
+    notifications=None,   # NotificationService
+    session_store=None,   # conversations.SessionStore (non-Telegram sessions)
 ):
-    """Process a single queue item: run Claude, handle timeout/retry, send response."""
-    # Lazy imports to avoid circular dependency
-    from .adapters.telegram import api as telegram
-    from .adapters.telegram.outbound import send_response, animate_status, get_thinking_message
-    from .topic import generate_provisional_name
+    """Process a single queue item: run Claude, handle timeout/retry, deliver the response.
 
+    Replies go to the item's conversation (any channel); silent sources publish
+    an Event only when there is something worth notifying.
+    """
+    notifications = notifications or _default_notifications(bot)
     session_name = runner.short_name
-    silent = item.source == "email" or item.metadata.get("reminder_type") in ("whatsapp", "gdrive-inbox", "sent-emails")
+    reminder_type = item.metadata.get("reminder_type", "")
+    silent = item.source == "email" or reminder_type in SCAN_TYPES
+    ref = item.ref_or_legacy(getattr(bot, "name", None) or "gtd")
 
-    # Lazy topic creation for emails — only create when we actually need to notify
-    async def _ensure_email_topic():
-        if item.source != "email" or item.thread_id is not None:
-            return
-        subject = item.metadata.get("subject", "(no subject)")
-        topic_name = generate_provisional_name(f"Email: {subject[:60]}", is_agent=True)
-        try:
-            result = await telegram.create_forum_topic(item.chat_id, topic_name, api_url=bot.api_url)
-            item.thread_id = result["result"]["message_thread_id"]
-        except Exception as e:
-            logger.warning(f"Failed to create topic for email triage: {e}")
-
-    # Send animated status (skip for emails — no Telegram notification)
-    message_id = None
-    animation_task = None
-    if not silent:
-        status = get_thinking_message()
-        status_msg = await telegram.send_message(
-            status,
-            chat_id=item.chat_id,
-            parse_mode="HTML",
-            api_url=bot.api_url,
-            message_thread_id=item.thread_id,
+    progress = None
+    if not silent and ref is not None:
+        progress = await notifications.start_progress(
+            ref,
+            inbound_message_id=item.metadata.get("inbound_message_id"),
+            continue_session=item.continue_session,
+            session_name=session_name,
         )
-        message_id = status_msg.get("result", {}).get("message_id")
 
-        if message_id:
-            animation_task = asyncio.create_task(
-                animate_status(item.chat_id, message_id, item.continue_session, session_name, api_url=bot.api_url, message_thread_id=item.thread_id)
-            )
+    async def _stop_progress(ok: bool) -> None:
+        nonlocal progress
+        handle, progress = progress, None
+        await notifications.stop_progress(handle, ok=ok)
 
+    async def _say(text: str) -> None:
+        """Short status line to the conversation (never for silent sources)."""
+        if not silent and ref is not None:
+            await notifications.reply(ref, text)
+
+    system_prompt = getattr(bot, 'system_prompt', None)
+    if item.channel_context:
+        system_prompt = (system_prompt + "\n\n" if system_prompt else "") + item.channel_context
+
+    _run_start = time.monotonic()
     try:
         logger.info(f"Processing queue item: source={item.source}, model={item.model or 'default'}, "
                      f"timeout={item.timeout}s, metadata={item.metadata}")
-        _run_start = time.monotonic()
-        from .providers import run_with_fallback, telegram_notifier
+        from .providers import run_with_fallback
         result = await run_with_fallback(
             runner,
             item.prompt,
-            notify=telegram_notifier(bot),
+            notify=_event_notifier(notifications),
             model=item.model,
             continue_session=item.continue_session,
             new_session=item.new_session,
             allowed_tools=item.allowed_tools,
             bypass_permissions=item.bypass_permissions,
-            system_prompt=getattr(bot, 'system_prompt', None),
+            system_prompt=system_prompt,
             mcp_config=getattr(bot, 'mcp_config_path', None),
             timeout=item.timeout,
         )
@@ -323,37 +395,20 @@ async def process_queue_item(
             was_available = not api_status.unavailable
             api_status.mark_unavailable(result.error or "unknown quota error")
             persistent_queue.save(item)
-            # Stop animation + delete status
-            if animation_task:
-                animation_task.cancel()
-                try: await animation_task
-                except asyncio.CancelledError: pass
-            if message_id:
-                await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
-            # First detection: prominent notification to main chat
+            await _stop_progress(ok=False)
+            # First detection: prominent notification
             if was_available:
-                await telegram.send_message(
-                    "⚠️ <b>Crédits API Claude épuisés.</b>\n"
-                    "Les messages sont automatiquement mis en file d'attente.\n"
-                    "Traitement auto dès que les crédits seront restaurés.",
-                    chat_id=bot.chat_id, parse_mode="HTML", api_url=bot.api_url,
-                )
+                await notifications.publish(Event(
+                    "llm_provider", "urgent",
+                    body="⚠️ **Crédits API Claude épuisés.**\n"
+                         "Les messages sont automatiquement mis en file d'attente.\n"
+                         "Traitement auto dès que les crédits seront restaurés.",
+                ))
             # Per-message notification (only for non-silent sources)
-            if not silent:
-                await telegram.send_message(
-                    f"📥 Message en file d'attente (position {persistent_queue.size}).",
-                    chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url,
-                    message_thread_id=item.thread_id,
-                )
+            await _say(f"📥 Message en file d'attente (position {persistent_queue.size}).")
             return
 
-        # Stop animation + delete status
-        if animation_task:
-            animation_task.cancel()
-            try: await animation_task
-            except asyncio.CancelledError: pass
-        if message_id:
-            await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
+        await _stop_progress(ok=not result.error)
 
         # If we got here with a successful result, clear unavailable flag
         if api_status and api_status.unavailable:
@@ -366,7 +421,6 @@ async def process_queue_item(
         # --- Structured metrics logging ---
         from .metrics import write_metric
         from .config import settings
-        reminder_type = item.metadata.get("reminder_type", "")
         _run_type = reminder_type or item.source
         write_metric(
             source=item.source,
@@ -391,21 +445,16 @@ async def process_queue_item(
             total_tokens = result.input_tokens + result.output_tokens
             if total_tokens > settings.cron_token_alert_threshold:
                 alert_msg = (
-                    f"\u26a0\ufe0f Cron <b>{_run_type}</b> a consomm\u00e9 "
-                    f"<b>{total_tokens // 1000}k tokens</b> "
+                    f"⚠️ Cron **{_run_type}** a consommé "
+                    f"**{total_tokens // 1000}k tokens** "
                     f"(seuil : {settings.cron_token_alert_threshold // 1000}k)"
                 )
                 if result.cost_usd:
-                    alert_msg += f"\n\U0001f4b0 Co\u00fbt : ${result.cost_usd:.2f}"
-                await telegram.send_message(
-                    alert_msg,
-                    chat_id=bot.chat_id,
-                    parse_mode="HTML",
-                    api_url=bot.api_url,
-                )
+                    alert_msg += f"\n\U0001f4b0 Coût : ${result.cost_usd:.2f}"
+                await notifications.publish(Event("token_alert", "normal", body=alert_msg))
 
         # Update pending-actions status for calendar actions
-        if item.metadata.get("reminder_type") == "calendar-action":
+        if reminder_type == "calendar-action":
             action_id = item.metadata.get("action_id")
             if action_id:
                 from .pending_actions import update_status as update_action_status
@@ -414,41 +463,32 @@ async def process_queue_item(
                 update_action_status(pending_path, action_id, "executed")
                 logger.info(f"Calendar action {action_id} marked as executed")
 
-        # Send response (silent sources: no "thinking" animation, selective output)
+        # Deliver the response (silent sources: selective output, no progress)
         if silent:
-            reminder_type = item.metadata.get("reminder_type", "")
-            if reminder_type in ("whatsapp", "gdrive-inbox", "sent-emails"):
-                # Periodic scan: send result only if Claude took a notable action
-                # Short responses like "OK", "Timestamp mis à jour" = nothing to report
-                text = (result.text or "").strip()
-                if text and text.upper() != "OK" and len(text) > 200:
-                    await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id, skip_buttons=True)
-                else:
-                    logger.info(f"{reminder_type} scan silent (no notable action, len={len(text)})")
-                    # Clean up session file to avoid polluting /resume history
-                    if result.session_id:
-                        from .claude import delete_session
-                        delete_session(result.session_id, runner.working_dir)
-            elif result.text and ("Claude/Urgent" in result.text or "Claude/Action" in result.text or "Claude/Brouillon" in result.text):
-                # Notify Telegram for actionable emails (Urgent, Action, Brouillon préparé)
-                await _ensure_email_topic()
-                await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id, skip_buttons=True)
-            elif result.text and "Claude/Info" not in result.text and len(result.text) > 150:
-                # Fallback: agent did work (long response) but forgot to include label string
-                # Likely an actionable email — notify rather than silently drop
-                subject = item.metadata.get("subject", "?")
-                logger.warning(f"Email triage fallback notification (no label in text, len={len(result.text)}): {subject}")
-                await _ensure_email_topic()
-                await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id, skip_buttons=True)
+            event = _silent_event(item, result.text)
+            if event is not None:
+                await notifications.publish(event)
+            elif reminder_type in SCAN_TYPES:
+                logger.info(f"{reminder_type} scan silent (no notable action, len={len((result.text or '').strip())})")
+                # Clean up session file to avoid polluting /resume history
+                if result.session_id:
+                    from .claude import delete_session
+                    delete_session(result.session_id, runner.working_dir)
             else:
-                subject = item.metadata.get("subject", "?")
-                logger.info(f"Email triage silent (no Telegram): {subject}")
+                logger.info(f"Email triage silent (no notification): {item.metadata.get('subject', '?')}")
         elif result.text:
-            await send_response(result.text, item.chat_id, session_name=session_name, api_url=bot.api_url, message_thread_id=item.thread_id)
+            if ref is not None:
+                await notifications.reply(ref, result.text, session_name=session_name)
+            else:
+                await notifications.publish(Event(item.event_type or "queue", "normal", body=result.text))
         elif item.source != "cron":
-            await telegram.send_message("<i>(pas de réponse)</i>", chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url, message_thread_id=item.thread_id)
+            await _say("_(pas de réponse)_")
         else:
-            logger.info(f"Cron {item.metadata.get('reminder_type', '?')} produced no output, skipping Telegram notification")
+            logger.info(f"Cron {reminder_type or '?'} produced no output, skipping notification")
+
+        # Non-Telegram conversations keep their Claude session across restarts
+        if ref is not None and ref.channel != "telegram" and session_store is not None:
+            session_store.save(ref.key, result.session_id or getattr(runner, "session_id", None))
 
         # --- Escalation detection ---
         # Agent can request a more powerful model via HTML markers
@@ -486,12 +526,15 @@ async def process_queue_item(
                     bypass_permissions=item.bypass_permissions,
                     timeout=item.timeout,
                     thread_id=item.thread_id,
+                    conversation=item.conversation,
+                    event_type=item.event_type,
+                    channel_context=item.channel_context,
                 )
                 await queue.enqueue(escalated_item)
                 logger.info(f"Escalated item queued ({escalate_to})")
 
         # --- Post-session memory enrichment (loaded from external file) ---
-        if item.source == "telegram" and result.text and len(result.text) > 100:
+        if item.source in ("telegram", "zulip") and result.text and len(result.text) > 100:
             from .main import _load_post_session_prompt
             post_prompt = _load_post_session_prompt()
             if post_prompt:
@@ -518,7 +561,6 @@ async def process_queue_item(
         logger.warning(f"Queue item timed out: {item.source} (retry={item.retry_count}, timeout={item.timeout}s)")
         _run_duration = time.monotonic() - _run_start
         from .metrics import write_metric
-        reminder_type = item.metadata.get("reminder_type", "")
         write_metric(
             source=item.source,
             run_type=reminder_type or item.source,
@@ -527,37 +569,20 @@ async def process_queue_item(
             num_turns=0, duration_s=_run_duration, duration_api_ms=0,
             status="timeout", session_id=None,
         )
-        # Stop animation
-        if animation_task:
-            animation_task.cancel()
-            try: await animation_task
-            except asyncio.CancelledError: pass
-        if message_id:
-            await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
+        await _stop_progress(ok=False)
 
         if item.can_retry and queue:
             retry_item = item.as_retry(str(e))
             await queue.enqueue(retry_item)
-            if not silent:
-                timeout_min = int(item.timeout // 60)
-                await telegram.send_message(
-                    f"⏰ Timeout après {timeout_min}min — retry automatique en cours...",
-                    chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url,
-                    message_thread_id=item.thread_id,
-                )
+            timeout_min = int(item.timeout // 60)
+            await _say(f"⏰ Timeout après {timeout_min}min — retry automatique en cours...")
         else:
             _write_dead_letter(item, f"TimeoutError after {item.retry_count + 1} attempts ({item.timeout}s)")
-            if not silent:
-                await telegram.send_message(
-                    "❌ Échec après 2 tentatives (timeout). Requête abandonnée.",
-                    chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url,
-                    message_thread_id=item.thread_id,
-                )
+            await _say("❌ Échec après 2 tentatives (timeout). Requête abandonnée.")
 
     except Exception as e:
         _run_duration = time.monotonic() - _run_start
         from .metrics import write_metric
-        reminder_type = item.metadata.get("reminder_type", "")
         write_metric(
             source=item.source,
             run_type=reminder_type or item.source,
@@ -566,18 +591,15 @@ async def process_queue_item(
             num_turns=0, duration_s=_run_duration, duration_api_ms=0,
             status="error", session_id=None,
         )
-        if animation_task:
-            animation_task.cancel()
-            try: await animation_task
-            except asyncio.CancelledError: pass
-        if message_id:
-            await telegram.delete_message(item.chat_id, message_id, api_url=bot.api_url)
+        await _stop_progress(ok=False)
 
         _write_dead_letter(item, str(e))
         logger.exception("Queue item processing error")
-        if not silent:
-            await telegram.send_message(
-                f"❌ <b>Erreur:</b> <code>{e}</code>",
-                chat_id=item.chat_id, parse_mode="HTML", api_url=bot.api_url,
-                message_thread_id=item.thread_id,
-            )
+        try:
+            await _say(f"❌ **Erreur:** `{e}`")
+        except Exception:
+            logger.warning("Could not report the error to the conversation", exc_info=True)
+
+    finally:
+        if progress is not None:
+            await _stop_progress(ok=False)

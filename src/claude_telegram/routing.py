@@ -31,6 +31,27 @@ _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 DEFAULT_CONFIG: dict = {"default": "telegram", "urgent": ["telegram"]}
 
+# Cron/pipeline name -> event type (the keys of `outputs` in the routing file).
+PIPELINE_EVENT_TYPES: dict[str, str] = {
+    "morning": "briefing_morning",
+    "evening": "briefing_evening",
+    "whatsapp": "whatsapp_triage",
+    "gdrive-inbox": "gdrive_inbox",
+    "agent-tasks": "agent_tasks",
+    "weekly": "weekly",
+    "sent-emails": "sent_emails",
+    "garmin-sync": "garmin",
+    "enrichment": "enrichment",
+    "limitless": "limitless",
+    "omi": "omi",
+    "zulip": "zulip_fallback",
+    "calendar-action": "calendar_action",
+}
+
+
+def event_type_for(reminder_type: str) -> str:
+    return PIPELINE_EVENT_TYPES.get(reminder_type, reminder_type.replace("-", "_"))
+
 
 @dataclass(frozen=True)
 class ChannelRef:
