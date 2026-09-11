@@ -1,13 +1,12 @@
 """FastAPI application - Telegram webhook handler."""
 
 import asyncio
-import html
 import json
 import logging
 import os
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -20,7 +19,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .bots import BotConfig, create_bots
-from .transcribe import transcribe_audio
 
 
 # Pipeline-enabled crons — run Python script instead of Claude CLI + MCP
@@ -71,19 +69,11 @@ def _load_post_session_prompt() -> str | None:
         logger.error(f"Failed to read post-session prompt: {e}")
         return None
 
-from .adapters.telegram import api as telegram
-from .adapters.telegram.outbound import (
-    animate_status,
-    get_continue_message,
-    get_thinking_message,
-    send_response,
-)
-from .claude import sessions, ClaudeResult, PermissionDenial, get_session_permission_mode, list_recent_sessions, read_session_messages, find_session_working_dir
+from .adapters.telegram import api as telegram  # bot bootstrap only (getMe, webhook)
+from .claude import sessions
 from .config import settings
-from .markdown import markdown_to_telegram_html, split_text
 from .tunnel import tunnel, CloudflareTunnel
 from .queue import QueueItem, RequestQueue, process_queue_item, PersistentQueue, ApiStatus
-from .topic import generate_provisional_name, extract_title_from_response, generate_title_fallback, format_topic_name, working_dir_name
 from .pending_actions import (
     add_action,
     cleanup_actions,
@@ -91,13 +81,29 @@ from .pending_actions import (
 )
 from .whatsapp_health import ensure_whatsapp_bridge
 from . import state
+from .adapters import build_outbounds
 from .adapters.telegram import handlers, computer_use
+from .conversations import SessionStore, runner_key
+from .notifications import NotificationService
+from .ports import Action, Event
+from .routing import RoutingPolicy, event_type_for, parse_severity
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# /channels/inject only answers local callers (tests, ops scripts on the host).
+INJECT_HOSTS = {"127.0.0.1", "::1"}
+
+
+def _notifier() -> NotificationService:
+    """The NotificationService built at startup (Telegram-only before that)."""
+    if state.notifications is not None:
+        return state.notifications
+    policy = RoutingPolicy.default()
+    return NotificationService(policy, build_outbounds(policy, state.bots, settings.resolved_data_dir))
 
 
 @asynccontextmanager
@@ -115,6 +121,15 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Failed to fetch username for {bot_name}: {e}")
     logger.info(f"Initialized bots: {list(state.bots.keys())}")
+
+    # Channels: routing policy + one outbound per configured channel
+    policy = RoutingPolicy.from_file(settings.channel_routing_path, settings.channel_env_file)
+    data_dir = settings.resolved_data_dir
+    outbounds = build_outbounds(policy, state.bots, data_dir)
+    state.notifications = NotificationService(policy, outbounds)
+    state.session_store = SessionStore(data_dir / "channel-sessions.json")
+    logger.info(f"Channels: default={policy.default_channel} urgent={policy.config.get('urgent')} "
+                f"outbounds={sorted(outbounds)}")
 
     mode = settings.mode
 
@@ -204,12 +219,10 @@ async def _replay_persistent_queue(bot: BotConfig, queue: RequestQueue):
 
     count = len(items_files)
     logger.info(f"Replaying {count} items from persistent queue")
-    await telegram.send_message(
-        f"✅ Claude est de retour ! Traitement de {count} message(s) en attente...",
-        chat_id=bot.chat_id,
-        parse_mode="HTML",
-        api_url=bot.api_url,
-    )
+    await _notifier().publish(Event(
+        "llm_provider", "info",
+        body=f"✅ Claude est de retour ! Traitement de {count} message(s) en attente...",
+    ))
 
     for item, filepath in items_files:
         added = await queue.enqueue(item)
@@ -220,6 +233,16 @@ async def _replay_persistent_queue(bot: BotConfig, queue: RequestQueue):
             break
 
 
+def _runner_for_item(item: QueueItem, bot: BotConfig):
+    """Telegram keeps one runner per topic; other channels one per conversation key."""
+    ref = item.ref_or_legacy()
+    if ref is None or ref.channel == "telegram":
+        thread_id = (ref.thread_id if ref else None) or item.thread_id or 0
+        return handlers.get_runner(bot, thread_id=thread_id)
+    working_dir = bot.fixed_working_dir or sessions.default_dir
+    return sessions.get_session(working_dir, thread_id=runner_key(ref))
+
+
 async def queue_worker(queue: RequestQueue, bot: BotConfig):
     """Worker loop: dequeue and process items one at a time."""
     logger.info("Queue worker started")
@@ -227,10 +250,12 @@ async def queue_worker(queue: RequestQueue, bot: BotConfig):
         try:
             item = await queue.dequeue()
             logger.info(f"Processing queued {item.source} request (retry={item.retry_count})")
-            runner = handlers.get_runner(bot, thread_id=item.thread_id or 0)
+            runner = _runner_for_item(item, bot)
             await process_queue_item(item, runner, bot, queue=queue,
                                      persistent_queue=state.persistent_queue,
-                                     api_status=state.api_status)
+                                     api_status=state.api_status,
+                                     notifications=state.notifications,
+                                     session_store=state.session_store)
             # After successful processing, replay persistent queue if API recovered
             if state.persistent_queue and not state.persistent_queue.is_empty and state.api_status and not state.api_status.unavailable:
                 await _replay_persistent_queue(bot, queue)
@@ -295,14 +320,10 @@ async def notify(event_type: str, request: Request):
     if event_type == "fitness-completed" and summary:
         gtd_bot = state.bots.get("gtd")
         if gtd_bot and state.gtd_queue is not None:
-            # Create a dedicated topic for the debrief
-            try:
-                thread_id = (await handlers._create_topic_for_message(
-                    "🏋️ Debrief séance fitness", gtd_bot.chat_id, gtd_bot,
-                ))
-            except Exception:
-                logger.exception("Failed to create fitness debrief topic")
-                thread_id = None
+            # Dedicated conversation for the debrief, on the routed channel
+            ref = await _notifier().open_conversation(
+                Event("fitness", "normal", title="🏋️ Debrief séance fitness"))
+            thread_id = ref.thread_id if ref is not None and ref.channel == "telegram" else None
 
             prompt = (
                 f"🏋️ Séance terminée — déclenche le debrief fitness.\n\n"
@@ -319,9 +340,11 @@ async def notify(event_type: str, request: Request):
                 timeout=600,
                 metadata={"type": "fitness-debrief"},
                 thread_id=thread_id,
+                conversation=ref,
+                event_type="fitness",
             )
             added = await state.gtd_queue.enqueue(item)
-            logger.info(f"Fitness debrief enqueued: {added}, thread_id={thread_id}")
+            logger.info(f"Fitness debrief enqueued: {added}, conversation={ref.key if ref else None}")
             return {"ok": True, "enqueued": added}
         else:
             logger.warning("Fitness debrief: no GTD bot or queue available")
@@ -335,13 +358,14 @@ async def notify(event_type: str, request: Request):
     if not target_bot:
         return {"ok": False, "error": "No bot configured"}
 
-    reply_markup = None
+    actions: list[Action] = []
 
+    # Markdown body: each outbound renders it for its own chat
     if event_type == "completed":
-        msg = "✅ <b>Claude has completed the task.</b>"
+        msg = "✅ **Claude has completed the task.**"
         if working_dir:
             dir_name = working_dir.split("/")[-1]
-            msg = f"✅ <b>Claude has completed</b> (<code>{html.escape(dir_name)}</code>)"
+            msg = f"✅ **Claude has completed** (`{dir_name}`)"
         if summary:
             # Truncate to ~5 lines for preview
             lines = summary.split("\n")
@@ -351,16 +375,10 @@ async def notify(event_type: str, request: Request):
             # Cap at 800 chars
             if len(preview) > 800:
                 preview = preview[:800] + "…"
-            try:
-                preview_html = markdown_to_telegram_html(preview)
-            except Exception:
-                preview_html = html.escape(preview)
-            msg += f"\n\n{preview_html}"
+            msg += f"\n\n{preview}"
         # Add "Continue" button if session_id is available
         if session_id:
-            reply_markup = {"inline_keyboard": [[
-                {"text": "Continue ➜", "callback_data": f"resume:{session_id}"},
-            ]]}
+            actions.append(Action("Continue ➜", f"resume:{session_id}"))
             # Store working_dir for the resume callback (can't fit in callback_data)
             if working_dir:
                 state.resume_working_dirs[session_id] = working_dir
@@ -369,10 +387,7 @@ async def notify(event_type: str, request: Request):
     else:
         msg = f"📢 Claude event: {event_type}"
 
-    await telegram.send_message(
-        msg, chat_id=target_bot.chat_id, parse_mode="HTML",
-        api_url=target_bot.api_url, reply_markup=reply_markup,
-    )
+    await _notifier().publish(Event(f"dev.{event_type}", "info", body=msg, actions=actions))
     return {"ok": True}
 
 
@@ -585,18 +600,19 @@ async def _process_email(data: dict, bot: BotConfig):
             timeout=900,  # 15 min for email (MCP-heavy: Gmail + Trello + GDrive)
             metadata={"subject": subject, "from": from_addr},
             thread_id=thread_id,
+            event_type="email_triage",
         )
         added = await state.gtd_queue.enqueue(item)
         if not added:
-            await telegram.send_message(
-                f"⚠️ Queue pleine, email ignoré: {subject}",
-                chat_id=bot.chat_id, parse_mode="HTML", api_url=bot.api_url,
-                message_thread_id=thread_id,
-            )
+            await _notifier().publish(Event(
+                "email_triage", "normal", title=f"Email: {subject[:60]}",
+                body=f"⚠️ Queue pleine, email ignoré : {subject}",
+            ))
     else:
         # Fallback: direct execution (shouldn't happen in production)
+        title = f"Email: {subject[:60]}"
         try:
-            runner = handlers.get_runner(bot, thread_id=thread_id or 0)
+            runner = handlers.get_runner(bot, thread_id=0)
             result = await runner.run(
                 prompt,
                 model="haiku",
@@ -605,17 +621,12 @@ async def _process_email(data: dict, bot: BotConfig):
                 system_prompt=bot.system_prompt,
                 mcp_config=bot.mcp_config_path,
             )
-            if result.text:
-                await send_response(result.text, bot.chat_id, session_name="gtd", api_url=bot.api_url, message_thread_id=thread_id)
-            else:
-                await telegram.send_message("(pas de réponse)", chat_id=bot.chat_id, api_url=bot.api_url, message_thread_id=thread_id)
+            await _notifier().publish(Event("email_triage", "normal", title=title,
+                                            body=result.text or "(pas de réponse)"))
         except Exception as e:
             logger.exception("Email processing error")
-            await telegram.send_message(
-                f"❌ Erreur traitement email: <code>{e}</code>\nSujet: {subject}",
-                chat_id=bot.chat_id, parse_mode="HTML", api_url=bot.api_url,
-                message_thread_id=thread_id,
-            )
+            await _notifier().publish(Event("email_triage", "normal", title=title,
+                                            body=f"❌ Erreur traitement email : `{e}`\nSujet : {subject}"))
 
 
 @app.post("/webhook/zulip")
@@ -665,6 +676,58 @@ async def webhook_zulip(request: Request):
 
     # Empty object = "bot has nothing to say right now".
     return JSONResponse({})
+
+
+@app.post("/channels/inject")
+async def channels_inject(request: Request):
+    """Local test hook: publish an Event or feed an InboundMessage to the core.
+
+    ``{"event": {"type", "severity", "title", "body"}}`` goes through the
+    RoutingPolicy like any cron output; ``{"inbound": {"channel",
+    "conversation_id", "topic", "text", "user", "user_name", "message_id"}}``
+    goes through the ConversationService like a real chat message.
+    Requires ``X-Webhook-Secret`` and a loopback caller.
+    """
+    import hmac
+
+    secret = request.headers.get("x-webhook-secret", "")
+    if not settings.webhook_secret or not hmac.compare_digest(secret, settings.webhook_secret):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    host = request.client.host if request.client else ""
+    if host not in INJECT_HOSTS:
+        logger.warning(f"channels/inject refused for remote host {host}")
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    data = await request.json()
+
+    if "event" in data:
+        raw = data["event"] or {}
+        event = Event(
+            raw.get("type", "test"), raw.get("severity", "info"),
+            title=raw.get("title", ""), body=raw.get("body", ""),
+        )
+        deliveries = await _notifier().publish(event)
+        return {"ok": True, "deliveries": [
+            {"channel": d.channel, "conversation": d.ref.key if d.ref else None,
+             "message_ids": d.message_ids, "error": d.error}
+            for d in deliveries or []
+        ]}
+
+    if "inbound" in data:
+        if state.conversations is None:
+            return JSONResponse({"error": "no conversation service"}, status_code=409)
+        raw = data["inbound"] or {}
+        from .ports import ConversationRef, InboundMessage
+
+        channel = raw.get("channel", "zulip")
+        ref = ConversationRef(channel, raw["conversation_id"], topic=raw.get("topic"))
+        await state.conversations.handle(InboundMessage(
+            channel=channel, conversation_id=ref.conversation_id, user=raw.get("user", ""),
+            text=raw.get("text", ""), reply_to=ref, message_id=raw.get("message_id"),
+            user_name=raw.get("user_name", ""),
+        ))
+        return {"ok": True, "conversation": ref.key}
+
+    return JSONResponse({"error": "expected 'event' or 'inbound'"}, status_code=400)
 
 
 @app.post("/cron/calendar-actions")
@@ -776,18 +839,12 @@ async def _process_calendar_actions(bot: BotConfig):
                 confirm_instructions=confirm_instructions,
             )
 
-            # Create Telegram topic
-            topic_name = generate_provisional_name(
-                f"📅 {event.get('title', 'Action calendrier')}", is_agent=True
-            )
-            thread_id = None
-            try:
-                topic_result = await telegram.create_forum_topic(
-                    bot.chat_id, topic_name, api_url=bot.api_url
-                )
-                thread_id = topic_result["result"]["message_thread_id"]
-            except Exception as e:
-                logger.warning(f"Calendar actions: failed to create topic for {action_id}: {e}")
+            # Dedicated conversation on the routed channel
+            ref = await _notifier().open_conversation(Event(
+                "calendar_action", "normal", title=f"📅 {event.get('title', 'Action calendrier')}"))
+            if ref is None:
+                logger.warning(f"Calendar actions: no conversation opened for {action_id}")
+            thread_id = ref.thread_id if ref is not None and ref.channel == "telegram" else None
 
             # Save to pending-actions.json
             action_entry = {
@@ -799,6 +856,7 @@ async def _process_calendar_actions(bot: BotConfig):
                 "confirm": confirm,
                 "status": "pending",
                 "thread_id": thread_id,
+                "conversation": ref.to_dict() if ref is not None else None,
                 "created_at": datetime.now().isoformat(),
                 "executed_at": None,
                 "resolved_at": None,
@@ -818,11 +876,13 @@ async def _process_calendar_actions(bot: BotConfig):
                         "action_id": action_id,
                     },
                     thread_id=thread_id,
+                    conversation=ref,
+                    event_type="calendar_action",
                 )
                 added = await state.gtd_queue.enqueue(item)
                 if added:
                     enqueued += 1
-                    logger.info(f"Calendar actions: enqueued {action_id} → topic {thread_id}")
+                    logger.info(f"Calendar actions: enqueued {action_id} → {ref.key if ref else 'no conversation'}")
             else:
                 logger.warning("Calendar actions: queue unavailable, skipping execution")
 
@@ -864,24 +924,16 @@ async def _process_pipeline_cron(reminder_type: str, bot: BotConfig):
 
     logger.info(f"Processing pipeline cron: {reminder_type}")
 
-    # Topic created lazily — only when there's output to send
-    thread_id = None
+    # The conversation is opened by the NotificationService only when there is output
+    event_type = event_type_for(reminder_type)
+    title = f"Cron: {reminder_type}"
 
-    async def _ensure_topic():
-        nonlocal thread_id
-        if thread_id is not None:
-            return thread_id
-        name = generate_provisional_name(f"Cron: {reminder_type}", is_agent=True)
-        try:
-            result = await telegram.create_forum_topic(bot.chat_id, name, api_url=bot.api_url)
-            thread_id = result["result"]["message_thread_id"]
-        except Exception as e:
-            logger.warning(f"Failed to create topic for pipeline {reminder_type}: {e}")
-        return thread_id
+    async def _publish(severity: str, body: str) -> None:
+        await _notifier().publish(Event(event_type, severity, title=title, body=body))
 
+    working_dir = settings.gtd_working_dir or "."
+    pipeline_timeout = PIPELINE_TIMEOUTS.get(reminder_type, 600)
     try:
-        working_dir = settings.gtd_working_dir or "."
-        pipeline_timeout = PIPELINE_TIMEOUTS.get(reminder_type, 600)
         proc = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: sp.run(
@@ -891,14 +943,16 @@ async def _process_pipeline_cron(reminder_type: str, bot: BotConfig):
             ),
         )
         output = proc.stdout.strip()
+        severity = "normal"
         if proc.returncode != 0:
             error_msg = proc.stderr.strip() if proc.stderr else "Unknown error"
             logger.error(f"Pipeline {reminder_type} failed (rc={proc.returncode}): {error_msg[:2000]}")
-            output = f"❌ Pipeline {reminder_type} error:\n<code>{error_msg[:1500]}</code>"
+            output = f"❌ Pipeline {reminder_type} error:\n```\n{error_msg[:1500]}\n```"
+        else:
+            output, severity = parse_severity(output)
 
         if output and output.upper() != "OK":
-            await _ensure_topic()
-            await send_response(output, bot.chat_id, session_name="gtd", api_url=bot.api_url, message_thread_id=thread_id)
+            await _publish(severity, output)
         else:
             logger.info(f"Pipeline {reminder_type} completed silently")
     except sp.TimeoutExpired:
@@ -913,12 +967,7 @@ async def _process_pipeline_cron(reminder_type: str, bot: BotConfig):
         if reminder_type == "enrichment" and enrichment_lock.exists():
             enrichment_lock.unlink(missing_ok=True)
             logger.info("Cleaned up enrichment lock after timeout")
-        await _ensure_topic()
-        await telegram.send_message(
-            f"❌ Pipeline {reminder_type} timeout ({pipeline_timeout}s)",
-            chat_id=bot.chat_id, parse_mode="HTML",
-            api_url=bot.api_url, message_thread_id=thread_id,
-        )
+        await _publish("urgent", f"❌ Pipeline {reminder_type} timeout ({pipeline_timeout}s)")
     except Exception as e:
         logger.exception(f"Pipeline {reminder_type} error")
         # Clean up lock files on error too
@@ -927,26 +976,23 @@ async def _process_pipeline_cron(reminder_type: str, bot: BotConfig):
             if lock_file.exists():
                 lock_file.unlink(missing_ok=True)
                 logger.info(f"Cleaned up lock after error: {lock_file}")
-        await _ensure_topic()
-        await telegram.send_message(
-            f"❌ Pipeline {reminder_type} error: <code>{e}</code>",
-            chat_id=bot.chat_id, parse_mode="HTML",
-            api_url=bot.api_url, message_thread_id=thread_id,
-        )
+        await _publish("normal", f"❌ Pipeline {reminder_type} error: `{e}`")
 
 
 async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
     """Process a cron reminder via Claude GTD."""
     logger.info(f"Processing cron reminder: {reminder_type}")
 
-    # Silent crons don't create topics
+    # Silent crons don't open a conversation (the queue publishes an Event if needed)
     silent = reminder_type in ("whatsapp", "gdrive-inbox", "sent-emails")
-    thread_id = None
+    event_type = event_type_for(reminder_type)
+    title = f"Cron: {reminder_type}"
+    ref = None
 
     # WhatsApp bridge pre-flight check
     if reminder_type == "whatsapp":
         async def _notify_bridge_down(text: str) -> None:
-            await telegram.send_message(text, chat_id=bot.chat_id, parse_mode="HTML", api_url=bot.api_url)
+            await _notifier().publish(Event("whatsapp_bridge", "urgent", body=text))
 
         bridge_ok = await ensure_whatsapp_bridge(bot.chat_id, bot.api_url, notify=_notify_bridge_down)
         if not bridge_ok:
@@ -954,12 +1000,10 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
             return
 
     if not silent:
-        name = generate_provisional_name(f"Cron: {reminder_type}", is_agent=True)
-        try:
-            result = await telegram.create_forum_topic(bot.chat_id, name, api_url=bot.api_url)
-            thread_id = result["result"]["message_thread_id"]
-        except Exception as e:
-            logger.warning(f"Failed to create topic for cron {reminder_type}: {e}")
+        ref = await _notifier().open_conversation(Event(event_type, "normal", title=title))
+        if ref is None:
+            logger.warning(f"No conversation opened for cron {reminder_type}")
+    thread_id = ref.thread_id if ref is not None and ref.channel == "telegram" else None
 
     if state.gtd_queue is not None:
         item = QueueItem(
@@ -971,6 +1015,8 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
             timeout=1800,  # 30 min for cron (enrichissement Trello par subagents)
             metadata={"reminder_type": reminder_type},
             thread_id=thread_id,
+            conversation=ref,
+            event_type=event_type,
         )
         added = await state.gtd_queue.enqueue(item)
         if not added:
@@ -988,16 +1034,12 @@ async def _process_cron(prompt: str, reminder_type: str, bot: BotConfig):
                 mcp_config=bot.mcp_config_path,
             )
             if result.text:
-                await send_response(result.text, bot.chat_id, session_name="gtd", api_url=bot.api_url, message_thread_id=thread_id)
+                await _notifier().publish(Event(event_type, "normal", title=title, body=result.text,
+                                                conversation_hint=ref))
         except Exception as e:
             logger.exception(f"Cron reminder error ({reminder_type})")
-            await telegram.send_message(
-                f"❌ Erreur rappel {reminder_type}: <code>{e}</code>",
-                chat_id=bot.chat_id,
-                parse_mode="HTML",
-                api_url=bot.api_url,
-                message_thread_id=thread_id,
-            )
+            await _notifier().publish(Event(event_type, "normal", title=title, conversation_hint=ref,
+                                            body=f"❌ Erreur rappel {reminder_type} : `{e}`"))
 
 
 @app.post("/test")

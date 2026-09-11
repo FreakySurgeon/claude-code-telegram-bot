@@ -369,30 +369,162 @@ async def test_send_response_long():
             assert mock_send.call_count >= 2  # Should split into multiple chunks
 
 
-def test_notify_completed():
-    """Test notification endpoint for completed."""
+class FakeNotifications:
+    """Records what producers publish instead of calling a chat API."""
+
+    def __init__(self, ref=None):
+        self.events = []
+        self.opened = []
+        self.ref = ref
+
+    async def publish(self, event):
+        self.events.append(event)
+        return []
+
+    async def open_conversation(self, event):
+        self.opened.append(event)
+        return self.ref
+
+
+def test_notify_completed_publishes_dev_event():
     bot = _make_dev_bot()
-    with patch.object(state, "bots", {"dev": bot}):
-        with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock):
-            response = client.post("/notify/completed")
-            assert response.status_code == 200
-            assert response.json()["ok"] is True
+    fake = FakeNotifications()
+    with patch.object(state, "bots", {"dev": bot}), patch.object(state, "notifications", fake):
+        response = client.post("/notify/completed", json={
+            "summary": "Tout est **fait**", "working_dir": "/home/x/projet", "session_id": "abc"})
+    assert response.json()["ok"] is True
+    [event] = fake.events
+    assert event.type == "dev.completed"
+    assert "`projet`" in event.body and "Tout est **fait**" in event.body
+    assert [(a.label, a.data) for a in event.actions] == [("Continue ➜", "resume:abc")]
+    assert state.resume_working_dirs["abc"] == "/home/x/projet"
 
 
 def test_notify_waiting():
-    """Test notification endpoint for waiting."""
     bot = _make_dev_bot()
-    with patch.object(state, "bots", {"dev": bot}):
-        with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock):
-            response = client.post("/notify/waiting")
-            assert response.status_code == 200
-            assert response.json()["ok"] is True
+    fake = FakeNotifications()
+    with patch.object(state, "bots", {"dev": bot}), patch.object(state, "notifications", fake):
+        response = client.post("/notify/waiting")
+    assert response.json()["ok"] is True
+    assert fake.events[0].type == "dev.waiting"
 
 
 def test_notify_custom():
-    """Test notification endpoint for custom event."""
     bot = _make_dev_bot()
-    with patch.object(state, "bots", {"dev": bot}):
-        with patch("claude_telegram.main.telegram.send_message", new_callable=AsyncMock):
-            response = client.post("/notify/custom_event")
-            assert response.status_code == 200
+    fake = FakeNotifications()
+    with patch.object(state, "bots", {"dev": bot}), patch.object(state, "notifications", fake):
+        response = client.post("/notify/custom_event")
+    assert response.status_code == 200
+    assert fake.events[0].type == "dev.custom_event"
+
+
+def test_notify_fitness_opens_conversation_and_enqueues():
+    from claude_telegram.ports import ConversationRef
+
+    gtd = BotConfig(name="gtd", token="t", chat_id="999", use_queue=True)
+    ref = ConversationRef("telegram", "999", thread_id=77, bot="gtd")
+    fake = FakeNotifications(ref=ref)
+    queue = MagicMock()
+    queue.enqueue = AsyncMock(return_value=1)
+    with patch.object(state, "bots", {"gtd": gtd}), patch.object(state, "notifications", fake), \
+            patch.object(state, "gtd_queue", queue):
+        response = client.post("/notify/fitness-completed", json={"summary": "Squats 3x10"})
+    assert response.json()["ok"] is True
+    assert fake.opened[0].type == "fitness"
+    item = queue.enqueue.await_args.args[0]
+    assert item.conversation == ref and item.thread_id == 77
+    assert "Squats 3x10" in item.prompt
+
+
+def _pipeline_run(tmp_path, reminder_type, *, run):
+    import asyncio
+    from claude_telegram import main
+
+    gtd = BotConfig(name="gtd", token="t", chat_id="999", use_queue=True)
+    fake = FakeNotifications()
+    with patch.object(state, "notifications", fake), patch("subprocess.run", run), \
+            patch.object(main.settings, "gtd_working_dir", str(tmp_path)):
+        asyncio.run(main._process_pipeline_cron(reminder_type, gtd))
+    return fake
+
+
+def test_pipeline_cron_output_publishes_event(tmp_path):
+    from types import SimpleNamespace
+
+    run = MagicMock(return_value=SimpleNamespace(returncode=0, stdout="Briefing du jour\n", stderr=""))
+    fake = _pipeline_run(tmp_path, "morning", run=run)
+    [event] = fake.events
+    assert (event.type, event.severity, event.title) == ("briefing_morning", "normal", "Cron: morning")
+    assert event.body == "Briefing du jour"
+
+
+def test_pipeline_cron_severity_marker(tmp_path):
+    from types import SimpleNamespace
+
+    run = MagicMock(return_value=SimpleNamespace(
+        returncode=0, stdout="<!-- severity: urgent -->\nRDV annulé", stderr=""))
+    fake = _pipeline_run(tmp_path, "whatsapp", run=run)
+    assert (fake.events[0].type, fake.events[0].severity, fake.events[0].body) == (
+        "whatsapp_triage", "urgent", "RDV annulé")
+
+
+def test_pipeline_cron_ok_is_silent(tmp_path):
+    from types import SimpleNamespace
+
+    fake = _pipeline_run(tmp_path, "zulip", run=MagicMock(
+        return_value=SimpleNamespace(returncode=0, stdout="OK", stderr="")))
+    assert fake.events == []
+
+
+def test_pipeline_cron_failure_is_normal_event(tmp_path):
+    from types import SimpleNamespace
+
+    fake = _pipeline_run(tmp_path, "evening", run=MagicMock(
+        return_value=SimpleNamespace(returncode=1, stdout="", stderr="Traceback boom")))
+    [event] = fake.events
+    assert event.severity == "normal" and "❌ Pipeline evening" in event.body and "boom" in event.body
+
+
+def test_pipeline_cron_timeout_is_urgent(tmp_path):
+    import subprocess
+
+    fake = _pipeline_run(tmp_path, "morning", run=MagicMock(
+        side_effect=subprocess.TimeoutExpired(cmd="x", timeout=600)))
+    [event] = fake.events
+    assert event.severity == "urgent" and "timeout" in event.body
+
+
+def test_channels_inject_requires_secret():
+    from claude_telegram import main
+
+    fake = FakeNotifications()
+    with patch.object(state, "notifications", fake), patch.object(main.settings, "webhook_secret", "s3cret"), \
+            patch.object(main, "INJECT_HOSTS", {"testclient"}):
+        denied = client.post("/channels/inject", json={"event": {"type": "test"}})
+        wrong = client.post("/channels/inject", json={"event": {"type": "test"}},
+                            headers={"X-Webhook-Secret": "nope"})
+    assert denied.status_code == 401 and wrong.status_code == 401
+    assert fake.events == []
+
+
+def test_channels_inject_refuses_remote_hosts():
+    from claude_telegram import main
+
+    fake = FakeNotifications()
+    with patch.object(state, "notifications", fake), patch.object(main.settings, "webhook_secret", "s3cret"):
+        response = client.post("/channels/inject", json={"event": {"type": "test"}},
+                               headers={"X-Webhook-Secret": "s3cret"})
+    assert response.status_code == 403 and fake.events == []
+
+
+def test_channels_inject_publishes_event():
+    from claude_telegram import main
+
+    fake = FakeNotifications()
+    with patch.object(state, "notifications", fake), patch.object(main.settings, "webhook_secret", "s3cret"), \
+            patch.object(main, "INJECT_HOSTS", {"testclient"}):
+        response = client.post("/channels/inject", headers={"X-Webhook-Secret": "s3cret"}, json={
+            "event": {"type": "test", "severity": "normal", "title": "Cron: test", "body": "Test étape 1"}})
+    assert response.status_code == 200
+    [event] = fake.events
+    assert (event.type, event.severity, event.title, event.body) == ("test", "normal", "Cron: test", "Test étape 1")

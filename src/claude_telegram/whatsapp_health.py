@@ -45,10 +45,10 @@ def _restart_bridge() -> bool:
 async def _send_notify_alert(notify: "Callable[[str], Awaitable[None]] | None") -> None:
     """Notify that the bridge is down, via the caller-provided notify callable."""
     msg = (
-        "⚠️ <b>WhatsApp bridge down</b> — tentative de relance échouée.\n\n"
+        "⚠️ **WhatsApp bridge down** — tentative de relance échouée.\n\n"
         "Vérifier :\n"
-        "<code>sudo systemctl status whatsapp-bridge</code>\n"
-        "<code>sudo journalctl -u whatsapp-bridge -n 50</code>\n\n"
+        "`sudo systemctl status whatsapp-bridge`\n"
+        "`sudo journalctl -u whatsapp-bridge -n 50`\n\n"
         "Si session expirée (~20j) : re-scanner le QR code."
     )
     if notify:
