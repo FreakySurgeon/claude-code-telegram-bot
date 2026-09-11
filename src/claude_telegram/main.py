@@ -84,6 +84,7 @@ from . import state
 from .adapters import build_outbounds
 from .adapters.telegram import handlers, computer_use
 from .conversations import SessionStore, runner_key
+from .email_prompt import build_email_triage_prompt
 from .notifications import NotificationService
 from .ports import Action, Event
 from .routing import RoutingPolicy, event_type_for, parse_severity
@@ -529,127 +530,20 @@ async def webhook_omi(request: Request):
 
 
 async def _process_email(data: dict, bot: BotConfig):
-    """Process an incoming email via Claude GTD triage."""
+    """Queue an email for triage: the agent writes a proposal for the inbox webapp.
+
+    Noise (agent's own emails, GitHub, Lifen, Mailiz, monitoring) is filtered by
+    the personal-org gate before this webhook is called: skipping here would
+    leave the email stuck in `analysing` in the webapp.
+    """
     from_addr = data.get("from", "unknown")
     subject = data.get("subject", "(no subject)")
-    body = data.get("body", "")[:4000]
-    date = data.get("date", "")
-    cc = data.get("cc", "")
-    attachments = data.get("attachments", [])
-    has_draft = data.get("hasDraft", False)
-    is_from_thomas = data.get("isFromThomas", False)
-    email_message_id = data.get("messageId", "")
-    email_thread_id = data.get("threadId", "")
-    is_reply = data.get("isReply", False)
-    thread_context = data.get("threadContext", "")
-    thomas_recipient_type = data.get("thomasRecipientType", "to")
+    logger.info(f"Processing email triage: '{subject}' from {from_addr} "
+                f"(reply={bool(data.get('isReply'))}, correction={bool(data.get('correction'))})")
 
-    logger.info(f"Processing email triage: '{subject}' from {from_addr} (fromThomas={is_from_thomas}, hasDraft={has_draft})")
-
-    # Skip self-triage: emails sent by the agent itself (from chauvet.t+claude@gmail.com)
-    if "chauvet.t+claude@gmail.com" in from_addr.lower():
-        logger.info(f"Skipping self-triage email: '{subject}' (sent by agent)")
-        return
-
-    # Skip GitHub notifications (defense-in-depth)
-    if "notifications@github.com" in from_addr.lower():
-        logger.info(f"Skipping GitHub notification: '{subject}'")
-        return
-
-    # Skip known automated notifications (defense-in-depth, primary filter is in Apps Script)
-    import re
-    IGNORED_SUBJECT_PATTERNS = [
-        re.compile(r"documents?\s+(patients?\s+)?re[çc]us?", re.IGNORECASE),  # Lifen DMP CMC
-        re.compile(r"dmp\s+cmc", re.IGNORECASE),
-        re.compile(r"lifen", re.IGNORECASE),
-        re.compile(r"nouveau message s[eé]curis[eé] re[çc]u sur mailiz", re.IGNORECASE),  # Mailiz
-    ]
-    IGNORED_SENDER_PATTERNS = [
-        re.compile(r"healthchecks\.io", re.IGNORECASE),  # Revicare monitoring
-    ]
-    if any(p.search(subject) for p in IGNORED_SUBJECT_PATTERNS):
-        logger.info(f"Skipping ignored subject: '{subject}' (auto-notification filter)")
-        return
-    if any(p.search(from_addr) for p in IGNORED_SENDER_PATTERNS):
-        logger.info(f"Skipping ignored sender: '{from_addr}' (auto-notification filter)")
-        return
-
-    # Topic created lazily in queue — only when there's output to send (not for Claude/Info)
+    # Topic created lazily in queue — only when there's output to send (urgent emails)
     thread_id = None
-
-    # Build attachment info
-    attachment_info = ""
-    if attachments:
-        att_lines = []
-        for att in attachments:
-            att_lines.append(f"  - {att.get('name', '?')} ({att.get('mimeType', '?')}, {att.get('size', 0)} bytes)")
-        attachment_info = f"\n**Pièces jointes** :\n" + "\n".join(att_lines) + "\n"
-
-    # Build draft info
-    draft_info = ""
-    if has_draft:
-        draft_info = "\n**⚠️ Un brouillon de réponse existe déjà dans ce thread** (probablement Jace). Lis-le via Gmail MCP avant de décider si tu dois en créer un autre.\n"
-
-    # Build CC context info
-    cc_context = ""
-    if thomas_recipient_type == "cc":
-        cc_context = (
-            "\n**📋 THOMAS EST EN COPIE (CC)** — Thomas n'est PAS le destinataire principal de cet email. "
-            "Il est en copie pour information. Adapte ton analyse en conséquence :\n"
-            "- Par défaut, cet email est **informatif** pour Thomas (Claude/Info)\n"
-            "- Ne lui attribue PAS d'action sauf si le contenu le mentionne explicitement ou lui demande quelque chose\n"
-            "- Si un tiers confirme une action (paiement, réponse, validation), **vérifie si une carte Trello existe** pour cette action et marque-la comme terminée\n"
-            "- Note les infos utiles dans `faits-recents.md` (ex: Flora a payé X, un collègue a confirmé Y)\n"
-        )
-    elif thomas_recipient_type == "none":
-        cc_context = (
-            "\n**⚠️ THOMAS N'EST NI EN TO: NI EN CC:** — Cet email est probablement arrivé via un forward ou une liste. "
-            "Traite-le comme informatif sauf preuve du contraire.\n"
-        )
-
-    # Build reply context info
-    reply_info = ""
-    if is_reply:
-        reply_info = (
-            "\n**🔄 RÉPONSE DANS UN THREAD DÉJÀ TRIÉ** — Ceci est une nouvelle réponse dans une conversation existante. "
-            "Le thread avait déjà été traité mais un nouveau message est arrivé. "
-            "Tu dois re-évaluer la situation : créer/mettre à jour la carte Trello, préparer un brouillon de réponse, "
-            "créer un événement Calendar si pertinent.\n"
-        )
-        if thread_context:
-            reply_info += f"\n**Contexte du thread (messages précédents)** :\n{thread_context}\n"
-
-    prompt = (
-        f"📧 **TRIAGE EMAIL{'  — RÉPONSE' if is_reply else ''}** - Applique les règles de la section \"Triage Email\" de ton prompt.\n\n"
-        f"---\n"
-        f"**De** : {from_addr}\n"
-        f"**À** : {data.get('to', '')}\n"
-        f"**CC** : {cc}\n"
-        f"**Sujet** : {subject}\n"
-        f"**Date** : {date}\n"
-        f"**Message ID** : {email_message_id}\n"
-        f"**Thread ID** : {email_thread_id}\n"
-        f"**Email de Thomas** : {'OUI' if is_from_thomas else 'NON'}\n"
-        f"**Position Thomas** : {'Destinataire principal (To:)' if thomas_recipient_type == 'to' else 'En copie (CC:)' if thomas_recipient_type == 'cc' else 'Ni To: ni CC:'}\n"
-        f"{cc_context}"
-        f"{attachment_info}"
-        f"{draft_info}"
-        f"{reply_info}\n"
-        f"**Contenu** :\n{body}\n"
-        f"---\n\n"
-        f"Traite cet email selon les règles de triage.\n"
-        f"NE PAS relire l'email via Gmail, le contenu est ci-dessus.\n"
-        f"Tu peux utiliser Gmail MCP pour : chercher dans le thread, lire les brouillons, "
-        f"télécharger les pièces jointes, appliquer les labels.\n"
-        f"⚠️ Pour envoyer le résumé, utilise UNIQUEMENT `scripts/send-agent-email.py` (SMTP agent@freakymex.ovh) "
-        f"avec --gmail-id \"{email_message_id}\" pour le threading. "
-        f"INTERDIT d'utiliser `send_email` ou `reply` du MCP Gmail pour les résumés.\n\n"
-        f"⚠️ RÈGLE CRITIQUE : Si tu classifies cet email comme `Claude/Info` (newsletter, notification, "
-        f"promo, spam, confirmation de commande, notification calendrier, etc.), tu dois UNIQUEMENT "
-        f"appliquer le label Gmail `Claude/Info` via modify_email. INTERDICTION ABSOLUE d'appeler "
-        f"`send_email` ou `reply` pour les emails classés Info. Zéro email de résumé. "
-        f"Juste le label, puis termine."
-    )
+    prompt = build_email_triage_prompt(data)
 
     if state.gtd_queue is not None:
         item = QueueItem(

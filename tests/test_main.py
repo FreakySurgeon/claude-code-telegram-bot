@@ -631,3 +631,24 @@ def test_cron_zulip_purges_payloads_seen_by_inbound(tmp_path):
     assert response.json()["mode"] == "pipeline"
     assert not (pending / "60.json").exists() and (pending / "61.json").exists()
     assert pipeline.call_args.args[0] == "zulip"
+
+
+def test_process_email_enqueues_proposal_prompt_without_backend_filters():
+    """Noise is filtered by the gate: the backend must queue every email it gets,
+    otherwise the email would stay stuck in `analysing` in the webapp."""
+    import asyncio
+    from claude_telegram import main
+
+    gtd = BotConfig(name="gtd", token="t", chat_id="999", use_queue=True)
+    queue = MagicMock()
+    queue.enqueue = AsyncMock(return_value=1)
+    data = {"messageId": "m1", "threadId": "t1", "from": "GitHub <notifications@github.com>",
+            "subject": "Lifen : documents reçus"}
+    with patch.object(state, "gtd_queue", queue):
+        asyncio.run(main._process_email(data, gtd))
+
+    item = queue.enqueue.await_args.args[0]
+    assert "python3 -m scripts.inbox.cli propose --message-id m1" in item.prompt
+    assert item.source == "email" and item.event_type == "email_triage"
+    assert item.thread_id is None and item.new_session is True
+    assert item.metadata == {"subject": "Lifen : documents reçus", "from": "GitHub <notifications@github.com>"}
