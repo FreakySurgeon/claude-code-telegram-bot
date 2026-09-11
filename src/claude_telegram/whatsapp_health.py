@@ -4,10 +4,10 @@ import asyncio
 import logging
 import socket
 import subprocess
+from typing import Awaitable, Callable
 
 import httpx
 
-from .adapters.telegram import api as telegram
 from .config import settings
 
 logger = logging.getLogger(__name__)
@@ -42,8 +42,8 @@ def _restart_bridge() -> bool:
         return False
 
 
-async def _send_telegram_alert(chat_id: str, api_url: str) -> None:
-    """Send a Telegram notification that the bridge is down."""
+async def _send_notify_alert(notify: "Callable[[str], Awaitable[None]] | None") -> None:
+    """Notify that the bridge is down, via the caller-provided notify callable."""
     msg = (
         "⚠️ <b>WhatsApp bridge down</b> — tentative de relance échouée.\n\n"
         "Vérifier :\n"
@@ -51,10 +51,11 @@ async def _send_telegram_alert(chat_id: str, api_url: str) -> None:
         "<code>sudo journalctl -u whatsapp-bridge -n 50</code>\n\n"
         "Si session expirée (~20j) : re-scanner le QR code."
     )
-    try:
-        await telegram.send_message(msg, chat_id=chat_id, parse_mode="HTML", api_url=api_url)
-    except Exception as e:
-        logger.error(f"Failed to send WhatsApp bridge alert: {e}")
+    if notify:
+        try:
+            await notify(msg)
+        except Exception as e:
+            logger.error(f"Failed to send WhatsApp bridge alert: {e}")
 
 
 async def _create_trello_fix_card() -> None:
@@ -113,13 +114,18 @@ async def _create_trello_fix_card() -> None:
             logger.error(f"Failed to create Trello fix card: {e}")
 
 
-async def ensure_whatsapp_bridge(chat_id: str, api_url: str) -> bool:
+async def ensure_whatsapp_bridge(
+    chat_id: str,
+    api_url: str,
+    *,
+    notify: "Callable[[str], Awaitable[None]] | None" = None,
+) -> bool:
     """Ensure the WhatsApp bridge is running. Returns True if bridge is up.
 
     Flow:
     1. TCP check → if up, return True
     2. If down → systemctl restart → wait → re-check
-    3. If still down → Telegram alert + Trello card → return False
+    3. If still down → notify (if provided) + Trello card → return False
     """
     if _bridge_is_up():
         return True
@@ -134,6 +140,6 @@ async def ensure_whatsapp_bridge(chat_id: str, api_url: str) -> bool:
 
     # Restart failed
     logger.error("WhatsApp bridge restart failed")
-    await _send_telegram_alert(chat_id, api_url)
+    await _send_notify_alert(notify)
     await _create_trello_fix_card()
     return False
