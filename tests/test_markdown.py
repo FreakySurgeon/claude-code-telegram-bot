@@ -147,3 +147,55 @@ class TestSafeTelegramText:
         """Test plain text without special chars."""
         result = safe_telegram_text("Hello world")
         assert result == "Hello world"
+
+
+class TestMarkdownToZulip:
+    def test_strips_title_and_comments(self):
+        from claude_telegram.markdown import markdown_to_zulip
+        out = markdown_to_zulip("Bonjour\n<!-- title: Courses -->\n<!-- escalate:opus -->")
+        assert out == "Bonjour"
+
+    def test_headings_become_bold(self):
+        from claude_telegram.markdown import markdown_to_zulip
+        assert markdown_to_zulip("## Agenda\n- a") == "**Agenda**\n- a"
+
+    def test_code_blocks_untouched(self):
+        from claude_telegram.markdown import markdown_to_zulip
+        src = "```\n# not a heading\n<b>x</b>\n```"
+        assert markdown_to_zulip(src) == src
+
+    def test_html_tags_to_markdown(self):
+        from claude_telegram.markdown import markdown_to_zulip
+        assert markdown_to_zulip("<b>gras</b> et <i>it</i><br>fin") == "**gras** et *it*\nfin"
+
+    def test_system_tags_removed(self):
+        from claude_telegram.markdown import markdown_to_zulip
+        assert markdown_to_zulip("a<system-reminder>secret</system-reminder>b") == "ab"
+
+
+class TestExtractButtonLabels:
+    def test_no_marker(self):
+        from claude_telegram.markdown import extract_button_labels
+        assert extract_button_labels("hello") == ("hello", [])
+
+    def test_json_labels(self):
+        from claude_telegram.markdown import extract_button_labels
+        assert extract_button_labels('Choix ?\n<!-- buttons: ["A", "B"] -->') == ("Choix ?", ["A", "B"])
+
+    def test_confirm_and_none(self):
+        from claude_telegram.markdown import extract_button_labels
+        assert extract_button_labels("ok <!-- buttons: confirm -->")[1] == ["✅ Confirmer", "❌ Annuler"]
+        assert extract_button_labels("ok <!-- buttons: none -->") == ("ok", [])
+
+
+class TestSplitText:
+    def test_splits_long_text_under_limit(self):
+        from claude_telegram.markdown import split_text
+        text = "\n".join(["x" * 900] * 25)
+        chunks = split_text(text, 10000)
+        assert len(chunks) == 3 and all(len(c) <= 10000 for c in chunks)
+        assert "\n".join(chunks) == text
+
+    def test_short_text_single_chunk(self):
+        from claude_telegram.markdown import split_text
+        assert split_text("a", 10) == ["a"]
