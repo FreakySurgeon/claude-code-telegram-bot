@@ -564,3 +564,119 @@ async def test_named_topic_not_renamed(mock_bot, clear_provider_state):
     await process_queue_item(item, runner, mock_bot, notifications=notifications)
 
     assert out.renamed == []
+
+
+# --- Channel provenance env for the agent (AGENTDECK_GUARD_*) ---
+
+ZULIP_REF = ConversationRef("zulip", "stream:general", topic="Topic")
+TELEGRAM_REF = ConversationRef("telegram", "12345", thread_id=7)
+GUARD_KEYS = {"AGENTDECK_GUARD_ORIGIN", "AGENTDECK_GUARD_REF"}
+
+
+@pytest.fixture
+def authorized_bot(mock_bot):
+    """MagicMock bot whose is_authorized behaves like BotConfig (only its own chat)."""
+    mock_bot.is_authorized = lambda chat_id: str(chat_id) == "12345"
+    return mock_bot
+
+
+def _guard_env(item, bot):
+    from claude_telegram.queue import channel_guard_env
+    return channel_guard_env(item, bot)
+
+
+def test_guard_env_zulip_conversation(authorized_bot):
+    item = QueueItem(prompt="x", source="zulip", conversation=ZULIP_REF,
+                     metadata={"inbound_message_id": "4242", "type": "zulip-conversation"})
+    assert _guard_env(item, authorized_bot) == {
+        "AGENTDECK_GUARD_ORIGIN": "zulip", "AGENTDECK_GUARD_REF": "4242"}
+
+
+def test_guard_env_zulip_survives_retry_and_escalation_copies(authorized_bot):
+    item = QueueItem(prompt="x", source="zulip", conversation=ZULIP_REF,
+                     metadata={"inbound_message_id": "4242"})
+    assert _guard_env(item.as_retry("boom"), authorized_bot)["AGENTDECK_GUARD_REF"] == "4242"
+
+
+@pytest.mark.parametrize("inbound_id", [None, "", "abc", "12 3", "-5", "4242\n", "٤٢"])
+def test_guard_env_zulip_needs_a_numeric_message_id(authorized_bot, inbound_id):
+    metadata = {} if inbound_id is None else {"inbound_message_id": inbound_id}
+    item = QueueItem(prompt="x", source="zulip", conversation=ZULIP_REF, metadata=metadata)
+    assert _guard_env(item, authorized_bot) is None
+
+
+def test_guard_env_zulip_without_conversation_or_metadata(authorized_bot):
+    assert _guard_env(QueueItem(prompt="x", source="zulip",
+                                metadata={"inbound_message_id": "4242"}), authorized_bot) is None
+    assert _guard_env(QueueItem(prompt="x", source="zulip", conversation=ZULIP_REF), authorized_bot) is None
+
+
+def test_guard_env_telegram_message_id_is_never_a_zulip_ref(authorized_bot):
+    """conversations.py stamps inbound_message_id for every channel: a non-Zulip id must not become a Zulip ref."""
+    item = QueueItem(prompt="x", source="telegram", conversation=TELEGRAM_REF,
+                     metadata={"inbound_message_id": "99", "type": "telegram-conversation"})
+    assert _guard_env(item, authorized_bot) is None  # no chat_id -> no telegram env either
+    with_chat = QueueItem(prompt="x", source="telegram", chat_id="12345", conversation=TELEGRAM_REF,
+                          metadata={"inbound_message_id": "99", "type": "telegram-conversation"})
+    env = _guard_env(with_chat, authorized_bot)
+    assert env["AGENTDECK_GUARD_ORIGIN"] == "telegram"
+    assert env["AGENTDECK_GUARD_REF"] != "99"
+
+
+def test_guard_env_telegram_authorized_chat_gets_fresh_ref(authorized_bot):
+    import re
+    item = QueueItem(prompt="x", source="telegram", chat_id="12345")
+    first, second = _guard_env(item, authorized_bot), _guard_env(item, authorized_bot)
+    for env in (first, second):
+        assert set(env) == GUARD_KEYS
+        assert env["AGENTDECK_GUARD_ORIGIN"] == "telegram"
+        assert re.fullmatch(r"telegram:[0-9a-f]{32}", env["AGENTDECK_GUARD_REF"])
+    assert first["AGENTDECK_GUARD_REF"] != second["AGENTDECK_GUARD_REF"]
+
+
+def test_guard_env_telegram_unauthorized_or_missing_chat(authorized_bot):
+    assert _guard_env(QueueItem(prompt="x", source="telegram", chat_id="99999"), authorized_bot) is None
+    assert _guard_env(QueueItem(prompt="x", source="telegram", chat_id=None), authorized_bot) is None
+    # A bot whose is_authorized does not return a real True never qualifies.
+    assert _guard_env(QueueItem(prompt="x", source="telegram", chat_id="12345"), MagicMock()) is None
+
+
+@pytest.mark.parametrize("source", ["cron", "email", "fitness", "calendar"])
+def test_guard_env_other_sources_get_nothing(authorized_bot, source):
+    item = QueueItem(prompt="x", source=source, chat_id="12345",
+                     metadata={"inbound_message_id": "4242"})
+    assert _guard_env(item, authorized_bot) is None
+
+
+@pytest.mark.asyncio
+async def test_process_queue_item_forwards_zulip_env_to_the_runner(authorized_bot, clear_provider_state):
+    item = QueueItem(prompt="x", source="zulip", conversation=ZULIP_REF, metadata={"inbound_message_id": "4242"})
+    runner = _runner(ClaudeResult(text="ok", permission_denials=[]))
+
+    await process_queue_item(item, runner, authorized_bot, notifications=FakeNotifications(),
+                             session_store=FakeSessionStore())
+
+    assert runner.run.call_args.kwargs["extra_env"] == {
+        "AGENTDECK_GUARD_ORIGIN": "zulip", "AGENTDECK_GUARD_REF": "4242"}
+
+
+@pytest.mark.asyncio
+async def test_process_queue_item_forwards_telegram_env_only_when_authorized(authorized_bot, clear_provider_state):
+    runner = _runner(ClaudeResult(text="ok", permission_denials=[]))
+    await process_queue_item(QueueItem(prompt="x", source="telegram", chat_id="12345"), runner, authorized_bot,
+                             notifications=FakeNotifications())
+    env = runner.run.call_args.kwargs["extra_env"]
+    assert env["AGENTDECK_GUARD_ORIGIN"] == "telegram" and env["AGENTDECK_GUARD_REF"].startswith("telegram:")
+
+    runner = _runner(ClaudeResult(text="ok", permission_denials=[]))
+    await process_queue_item(QueueItem(prompt="x", source="telegram", chat_id="99999"), runner, authorized_bot,
+                             notifications=FakeNotifications())
+    assert runner.run.call_args.kwargs["extra_env"] is None
+
+
+@pytest.mark.asyncio
+async def test_process_queue_item_cron_has_no_guard_env(authorized_bot, clear_provider_state):
+    item = QueueItem(prompt="x", source="cron", chat_id="12345", metadata={"reminder_type": "morning"})
+    runner = _runner(ClaudeResult(text="ok", permission_denials=[]))
+    await process_queue_item(item, runner, authorized_bot, notifications=FakeNotifications())
+    assert runner.run.call_args.kwargs["extra_env"] is None

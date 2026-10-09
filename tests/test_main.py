@@ -652,3 +652,40 @@ def test_process_email_enqueues_proposal_prompt_without_backend_filters():
     assert item.source == "email" and item.event_type == "email_triage"
     assert item.thread_id is None and item.new_session is True
     assert item.metadata == {"subject": "Lifen : documents reçus", "from": "GitHub <notifications@github.com>"}
+
+
+async def _run_claude_capturing_extra_env(chat_id: str):
+    """Run run_claude with the LLM chain mocked; return the extra_env it forwarded."""
+    from claude_telegram.claude import ClaudeResult
+    bot = _make_dev_bot()
+    mock_runner = MagicMock()
+    mock_runner.is_running = False
+    mock_runner.is_in_conversation.return_value = False
+    mock_runner.context_shown = True
+    mock_runner.short_name = "default"
+    h = "claude_telegram.adapters.telegram.handlers"
+    with patch(f"{h}.get_runner", return_value=mock_runner), \
+         patch(f"{h}.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}), \
+         patch(f"{h}.telegram.delete_message", new_callable=AsyncMock), \
+         patch(f"{h}.animate_status", new_callable=AsyncMock), \
+         patch(f"{h}.send_response", new_callable=AsyncMock), \
+         patch("claude_telegram.providers.run_with_fallback", new_callable=AsyncMock,
+               return_value=ClaudeResult(text="ok", permission_denials=[])) as mock_fallback:
+        await run_claude("salut", chat_id, bot)
+    return mock_fallback.call_args.kwargs["extra_env"]
+
+
+@pytest.mark.asyncio
+async def test_run_claude_stamps_telegram_provenance_for_the_authorized_chat():
+    import re
+    first = await _run_claude_capturing_extra_env("12345")
+    second = await _run_claude_capturing_extra_env("12345")
+    for env in (first, second):
+        assert env["AGENTDECK_GUARD_ORIGIN"] == "telegram"
+        assert re.fullmatch(r"telegram:[0-9a-f]{32}", env["AGENTDECK_GUARD_REF"])
+    assert first["AGENTDECK_GUARD_REF"] != second["AGENTDECK_GUARD_REF"]
+
+
+@pytest.mark.asyncio
+async def test_run_claude_no_provenance_for_an_unauthorized_chat():
+    assert await _run_claude_capturing_extra_env("99999") is None

@@ -23,7 +23,7 @@ from ...claude import (
 )
 from ...config import settings
 from ...markdown import split_text
-from ...queue import QueueItem
+from ...queue import QueueItem, new_telegram_guard_env
 from ...topic import (
     extract_title_from_response,
     format_topic_name,
@@ -1216,6 +1216,9 @@ async def run_claude(
             animate_status(chat_id, message_id, continue_session, session_name, api_url=bot.api_url, message_thread_id=thread_id)
         )
 
+    # Channel provenance for the agent: authorized chats only, fresh ref per run.
+    guard_env = new_telegram_guard_env() if bot.is_authorized(chat_id) is True else None
+
     try:
         from ...providers import run_with_fallback, telegram_notifier
         result = await run_with_fallback(
@@ -1228,6 +1231,7 @@ async def run_claude(
             bypass_permissions=bypass_permissions,
             system_prompt=bot.system_prompt,
             mcp_config=bot.mcp_config_path,
+            extra_env=guard_env,
         )
 
         # Stop animation

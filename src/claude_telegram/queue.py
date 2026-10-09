@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -293,6 +294,35 @@ def _default_notifications(bot):
     return NotificationService(RoutingPolicy.default(), {"telegram": TelegramOutbound({bot.name: bot})})
 
 
+def new_telegram_guard_env() -> dict[str, str]:
+    """Channel-provenance env for a run triggered by an authorized Telegram chat.
+
+    One fresh opaque ref per run: ``telegram:`` + 32 lowercase hex characters.
+    """
+    return {"AGENTDECK_GUARD_ORIGIN": "telegram", "AGENTDECK_GUARD_REF": f"telegram:{uuid.uuid4().hex}"}
+
+
+def channel_guard_env(item: "QueueItem", bot) -> dict[str, str] | None:
+    """Channel-provenance env (``AGENTDECK_GUARD_*``) for the engine, or None.
+
+    - Zulip conversation: ref = the inbound Zulip message id (digits only), so
+      the gateway can re-read that message through the Zulip API.
+    - Telegram: only when the chat is authorized for this bot; fresh ref per run.
+    Any other source (cron, email, fitness, calendar...) gets no env at all.
+    """
+    if item.source == "zulip":
+        if item.conversation is None or item.conversation.channel != "zulip":
+            return None
+        inbound_id = str((item.metadata or {}).get("inbound_message_id") or "")
+        if not (inbound_id.isascii() and inbound_id.isdigit()):
+            return None
+        return {"AGENTDECK_GUARD_ORIGIN": "zulip", "AGENTDECK_GUARD_REF": inbound_id}
+    if item.source == "telegram":
+        if item.chat_id and bot.is_authorized(item.chat_id) is True:
+            return new_telegram_guard_env()
+    return None
+
+
 def _event_notifier(notifications):
     """LLM-provider alerts (fallback chain) published as ``llm_provider`` events."""
     async def _notify(text: str, severity: str) -> None:
@@ -411,6 +441,7 @@ async def process_queue_item(
             system_prompt=system_prompt,
             mcp_config=getattr(bot, 'mcp_config_path', None),
             timeout=item.timeout,
+            extra_env=channel_guard_env(item, bot),
         )
 
         # Check for quota error — persist and notify

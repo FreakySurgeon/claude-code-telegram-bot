@@ -298,6 +298,23 @@ def get_session_permission_mode(working_dir: str) -> str | None:
     return None
 
 
+def _prepend_to_path(env: dict[str, str], directory: str | None) -> None:
+    """Put one absolute directory first in env["PATH"] (no-op if unusable or already first).
+
+    Ignores empty/relative values and values holding several entries, so a bad
+    setting can never add the current directory or a relative entry to PATH.
+    """
+    directory = (directory or "").strip()
+    if not directory or not os.path.isabs(directory) or os.pathsep in directory:
+        return
+    current = env.get("PATH", "")
+    if not current:
+        env["PATH"] = directory  # no trailing separator: an empty entry means "cwd"
+        return
+    if current.split(os.pathsep)[0] != directory:
+        env["PATH"] = directory + os.pathsep + current
+
+
 class ClaudeRunner:
     """Runs Claude Code for a specific working directory."""
 
@@ -376,6 +393,7 @@ class ClaudeRunner:
         mcp_config: str | None = None,
         timeout: float = 600,
         provider_env: dict[str, str | None] | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> ClaudeResult:
         """
         Run Claude Code with a message.
@@ -392,6 +410,7 @@ class ClaudeRunner:
             mcp_config: Optional path to MCP config file
             timeout: Timeout in seconds (default 600s / 10 minutes)
             provider_env: Env overrides for the LLM provider (None value removes the variable)
+            extra_env: Env vars added after provider_env (e.g. channel provenance for the agent)
 
         Returns:
             ClaudeResult with response text and any permission denials
@@ -457,6 +476,9 @@ class ClaudeRunner:
                 env.pop(key, None)
             else:
                 env[key] = value
+        for key, value in (extra_env or {}).items():
+            env[key] = value
+        _prepend_to_path(env, os.environ.get("GTD_PATH_PREPEND"))
 
         self.current_process = await asyncio.create_subprocess_exec(
             *cmd,

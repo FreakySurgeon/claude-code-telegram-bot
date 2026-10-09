@@ -343,6 +343,79 @@ async def test_run_default_timeout(runner, mock_process):
         assert result.text == "OK"
 
 
+# --- Subprocess env: channel provenance + PATH prepend ---
+
+async def _captured_env(runner, mock_process, **run_kwargs):
+    """Run once and return the env handed to the subprocess."""
+    mock_process.stdout = async_iter(make_stream_json("ok"))
+    with patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec:
+        await runner.run("salut", **run_kwargs)
+    return mock_exec.call_args[1]["env"]
+
+
+@pytest.mark.asyncio
+async def test_extra_env_and_path_prepend_reach_the_subprocess(runner, mock_process, monkeypatch):
+    monkeypatch.setenv("GTD_PATH_PREPEND", "/opt/shim")
+    env = await _captured_env(
+        runner, mock_process,
+        extra_env={"AGENTDECK_GUARD_ORIGIN": "zulip", "AGENTDECK_GUARD_REF": "42"},
+    )
+    assert env["AGENTDECK_GUARD_ORIGIN"] == "zulip" and env["AGENTDECK_GUARD_REF"] == "42"
+    assert env["PATH"].split(":")[0] == "/opt/shim"
+    assert env["CLAUDE_TELEGRAM_BOT"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_no_extra_env_leaves_env_untouched(runner, mock_process, monkeypatch):
+    monkeypatch.delenv("GTD_PATH_PREPEND", raising=False)
+    monkeypatch.delenv("AGENTDECK_GUARD_ORIGIN", raising=False)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    env = await _captured_env(runner, mock_process)
+    assert "AGENTDECK_GUARD_ORIGIN" not in env
+    assert env["PATH"] == "/usr/bin:/bin"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["", "   ", "relative/shim", "./shim", "shim", "/a:/b"])
+async def test_path_prepend_ignores_unusable_values(runner, mock_process, monkeypatch, bad):
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("GTD_PATH_PREPEND", bad)
+    env = await _captured_env(runner, mock_process)
+    assert env["PATH"] == "/usr/bin:/bin"
+
+
+@pytest.mark.asyncio
+async def test_path_prepend_not_duplicated_when_already_first(runner, mock_process, monkeypatch):
+    monkeypatch.setenv("PATH", "/opt/shim:/usr/bin")
+    monkeypatch.setenv("GTD_PATH_PREPEND", "/opt/shim")
+    env = await _captured_env(runner, mock_process)
+    assert env["PATH"] == "/opt/shim:/usr/bin"
+
+
+@pytest.mark.asyncio
+async def test_path_prepend_moves_ahead_of_existing_entry(runner, mock_process, monkeypatch):
+    monkeypatch.setenv("PATH", "/usr/bin:/opt/shim:/bin")
+    monkeypatch.setenv("GTD_PATH_PREPEND", "/opt/shim")
+    env = await _captured_env(runner, mock_process)
+    assert env["PATH"].split(":")[0] == "/opt/shim"
+
+
+@pytest.mark.asyncio
+async def test_path_prepend_with_empty_path_adds_no_cwd_entry(runner, mock_process, monkeypatch):
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("GTD_PATH_PREPEND", "/opt/shim")
+    env = await _captured_env(runner, mock_process)
+    assert env["PATH"] == "/opt/shim"
+
+
+@pytest.mark.asyncio
+async def test_extra_env_cannot_displace_the_path_prepend(runner, mock_process, monkeypatch):
+    """extra_env is applied first, the prepend last: a PATH in extra_env keeps the shim in front."""
+    monkeypatch.setenv("GTD_PATH_PREPEND", "/opt/shim")
+    env = await _captured_env(runner, mock_process, extra_env={"PATH": "/evil:/usr/bin"})
+    assert env["PATH"] == "/opt/shim:/evil:/usr/bin"
+
+
 # --- SessionManager hierarchical tests ---
 
 from claude_telegram.claude import SessionManager

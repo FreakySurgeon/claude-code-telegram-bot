@@ -180,3 +180,23 @@ async def test_dm_place_label(env):
     await env.service.handle(InboundMessage(channel="zulip", conversation_id=dm.conversation_id, user="t@example.com",
                                             text="hello", reply_to=dm, message_id="1", user_name="Thomas"))
     assert env.submitted[0].prompt.startswith("[zulip · DM · de Thomas]\n")
+
+
+async def test_queued_zulip_item_carries_the_inbound_id_as_guard_ref(env):
+    from claude_telegram.queue import channel_guard_env
+    await env.service.handle(msg(message_id="42"))
+    [item] = env.submitted
+    assert channel_guard_env(item, MagicMock()) == {
+        "AGENTDECK_GUARD_ORIGIN": "zulip", "AGENTDECK_GUARD_REF": "42"}
+
+
+async def test_queued_non_zulip_conversation_gets_no_zulip_guard_env(env):
+    """conversations.py stamps inbound_message_id on every channel; only Zulip may turn it into a ref."""
+    from claude_telegram.queue import channel_guard_env
+    tg_ref = ConversationRef("telegram", "12345", thread_id=7)
+    tg_msg = InboundMessage(channel="telegram", conversation_id="12345", user="u", text="salut",
+                            reply_to=tg_ref, message_id="99", user_name="U")
+    await env.service.handle(tg_msg)
+    [item] = env.submitted
+    assert item.metadata["inbound_message_id"] == "99"
+    assert channel_guard_env(item, MagicMock()) is None
