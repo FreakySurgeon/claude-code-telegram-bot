@@ -654,38 +654,268 @@ def test_process_email_enqueues_proposal_prompt_without_backend_filters():
     assert item.metadata == {"subject": "Lifen : documents reçus", "from": "GitHub <notifications@github.com>"}
 
 
-async def _run_claude_capturing_extra_env(chat_id: str):
-    """Run run_claude with the LLM chain mocked; return the extra_env it forwarded."""
-    from claude_telegram.claude import ClaudeResult
-    bot = _make_dev_bot()
-    mock_runner = MagicMock()
-    mock_runner.is_running = False
-    mock_runner.is_in_conversation.return_value = False
-    mock_runner.context_shown = True
-    mock_runner.short_name = "default"
-    h = "claude_telegram.adapters.telegram.handlers"
-    with patch(f"{h}.get_runner", return_value=mock_runner), \
-         patch(f"{h}.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}), \
-         patch(f"{h}.telegram.delete_message", new_callable=AsyncMock), \
-         patch(f"{h}.animate_status", new_callable=AsyncMock), \
-         patch(f"{h}.send_response", new_callable=AsyncMock), \
-         patch("claude_telegram.providers.run_with_fallback", new_callable=AsyncMock,
-               return_value=ClaudeResult(text="ok", permission_denials=[])) as mock_fallback:
-        await run_claude("salut", chat_id, bot)
-    return mock_fallback.call_args.kwargs["extra_env"]
+
+# --- Channel provenance (AGENTDECK_GUARD_*) is opt-in from the authenticated polling loop ---
+
+import asyncio
+import tempfile
+from contextlib import contextmanager
+from types import SimpleNamespace
+
+from claude_telegram.claude import ClaudeResult
+from claude_telegram.queue import RequestQueue, channel_guard_env
+
+from claude_telegram.adapters.telegram import handlers
+
+HANDLERS = "claude_telegram.adapters.telegram.handlers"
+AUTHORIZED_CHAT = {"id": 12345}
+GUARD_KEYS = {"AGENTDECK_GUARD_ORIGIN", "AGENTDECK_GUARD_REF"}
 
 
-@pytest.mark.asyncio
-async def test_run_claude_stamps_telegram_provenance_for_the_authorized_chat():
+def _gtd_queue_bot() -> BotConfig:
+    return BotConfig(name="dev", token="t", chat_id="12345", use_queue=True,
+                     commands_whitelist=["/c", "/continue", "/new"])
+
+
+def _text_update(text="Hello", chat=AUTHORIZED_CHAT):
+    return {"update_id": 1, "message": {"message_id": 5, "chat": chat, "text": text,
+                                        "is_topic_message": True, "message_thread_id": 42}}
+
+
+def _callback_update(data, chat=AUTHORIZED_CHAT):
+    return {"update_id": 1, "callback_query": {
+        "id": "cb1", "data": data,
+        "message": {"message_id": 9, "chat": chat, "message_thread_id": 42, "text": "t"}}}
+
+
+@contextmanager
+def _telegram_stack(monkeypatch, tmp_path):
+    """Patch everything run_claude / the handlers touch; yield the mocked LLM chain entry point."""
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    runner = MagicMock()
+    runner.is_running = False
+    runner.is_in_conversation.return_value = False
+    runner.context_shown = True
+    runner.short_name = "default"
+    stack = [
+        patch(f"{HANDLERS}.get_runner", return_value=runner),
+        patch(f"{HANDLERS}.telegram.send_message", new_callable=AsyncMock, return_value={"result": {"message_id": 1}}),
+        patch(f"{HANDLERS}.telegram.delete_message", new_callable=AsyncMock),
+        patch(f"{HANDLERS}.telegram.answer_callback", new_callable=AsyncMock),
+        patch(f"{HANDLERS}.telegram.get_file", new_callable=AsyncMock, return_value={"result": {"file_path": "f.ogg"}}),
+        patch(f"{HANDLERS}.telegram.download_file", new_callable=AsyncMock, return_value=b"data"),
+        patch(f"{HANDLERS}.transcribe_audio", new_callable=AsyncMock,
+              return_value=SimpleNamespace(text="hi", duration_formatted="0:01", engine="w")),
+        patch(f"{HANDLERS}.animate_status", new_callable=AsyncMock),
+        patch(f"{HANDLERS}.send_response", new_callable=AsyncMock),
+        patch(f"{HANDLERS}.generate_title_fallback", new_callable=AsyncMock, return_value=None),
+        patch(f"{HANDLERS}._create_topic_for_message", new_callable=AsyncMock, return_value=42),
+    ]
+    fallback = patch("claude_telegram.providers.run_with_fallback", new_callable=AsyncMock,
+                     return_value=ClaudeResult(text="ok", permission_denials=[]))
+    for p in stack:
+        p.start()
+    try:
+        with fallback as mock_fallback:
+            yield mock_fallback
+    finally:
+        for p in reversed(stack):
+            p.stop()
+
+
+async def _poll(bot, update):
+    """Drive the real polling loop with one update, then stop it."""
+    with patch(f"{HANDLERS}.telegram.get_updates", new_callable=AsyncMock,
+               side_effect=[[update], asyncio.CancelledError()]):
+        await handlers.poll_updates(bot)
+
+
+def _forwarded_env(mock_fallback):
+    [call] = mock_fallback.call_args_list
+    return call.kwargs["extra_env"]
+
+
+def _assert_stamped(env):
     import re
-    first = await _run_claude_capturing_extra_env("12345")
-    second = await _run_claude_capturing_extra_env("12345")
-    for env in (first, second):
-        assert env["AGENTDECK_GUARD_ORIGIN"] == "telegram"
-        assert re.fullmatch(r"telegram:[0-9a-f]{32}", env["AGENTDECK_GUARD_REF"])
-    assert first["AGENTDECK_GUARD_REF"] != second["AGENTDECK_GUARD_REF"]
+    assert set(env) == GUARD_KEYS
+    assert env["AGENTDECK_GUARD_ORIGIN"] == "telegram"
+    assert re.fullmatch(r"telegram:[0-9a-f]{32}", env["AGENTDECK_GUARD_REF"])
+
+
+def _assert_unstamped(env):
+    assert env is None or not (set(env) & GUARD_KEYS)
+
+
+@pytest.fixture
+def dev_bot():
+    return _make_dev_bot()
+
+
+# (1) polling update from the authorized chat -> stamped
+
+@pytest.mark.asyncio
+async def test_polled_text_via_run_claude_is_stamped(monkeypatch, tmp_path, dev_bot):
+    with _telegram_stack(monkeypatch, tmp_path) as fallback:
+        await _poll(dev_bot, _text_update("Hello"))
+    _assert_stamped(_forwarded_env(fallback))
 
 
 @pytest.mark.asyncio
-async def test_run_claude_no_provenance_for_an_unauthorized_chat():
-    assert await _run_claude_capturing_extra_env("99999") is None
+async def test_polled_command_is_stamped(monkeypatch, tmp_path, dev_bot):
+    with _telegram_stack(monkeypatch, tmp_path) as fallback:
+        await _poll(dev_bot, _text_update("/c bonjour"))
+    _assert_stamped(_forwarded_env(fallback))
+
+
+@pytest.mark.asyncio
+async def test_polled_refs_are_fresh_per_run(monkeypatch, tmp_path, dev_bot):
+    with _telegram_stack(monkeypatch, tmp_path) as fallback:
+        await _poll(dev_bot, _text_update("Hello"))
+        await _poll(dev_bot, _text_update("Hello again"))
+    refs = [c.kwargs["extra_env"]["AGENTDECK_GUARD_REF"] for c in fallback.call_args_list]
+    assert len(refs) == 2 and refs[0] != refs[1]
+
+
+@pytest.mark.asyncio
+async def test_polled_update_from_another_chat_is_not_stamped(monkeypatch, tmp_path, dev_bot):
+    with _telegram_stack(monkeypatch, tmp_path) as fallback:
+        await _poll(dev_bot, _text_update("Hello", chat={"id": 99999}))
+    fallback.assert_not_called()
+
+
+def _voice_update():
+    return {"update_id": 1, "message": {"message_id": 5, "chat": AUTHORIZED_CHAT, "voice": {"file_id": "v"},
+                                        "is_topic_message": True, "message_thread_id": 42}}
+
+
+def _photo_update():
+    return {"update_id": 1, "message": {"message_id": 5, "chat": AUTHORIZED_CHAT, "photo": [{"file_id": "p"}],
+                                        "is_topic_message": True, "message_thread_id": 42}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("update", [_text_update("Hello"), _voice_update(), _photo_update()],
+                         ids=["text", "voice", "photo"])
+async def test_polled_item_for_the_queued_bot_carries_the_marker_and_is_stamped(monkeypatch, tmp_path, update):
+    bot, q = _gtd_queue_bot(), RequestQueue(maxsize=5)
+    with _telegram_stack(monkeypatch, tmp_path), patch.object(state, "gtd_queue", q):
+        await _poll(bot, update)
+    item = await q.dequeue()
+    assert item.source == "telegram" and item.metadata["trusted_transport"] == "telegram-polling"
+    _assert_stamped(channel_guard_env(item, bot))
+
+
+# (2) /test never stamps (plain text and the commands reaching run_claude)
+
+@pytest.mark.parametrize("text", ["plain text", "/c x", "/continue x", "/new x"])
+def test_test_endpoint_is_never_stamped(monkeypatch, tmp_path, dev_bot, text):
+    with _telegram_stack(monkeypatch, tmp_path) as fallback, patch.object(state, "bots", {"dev": dev_bot}):
+        response = client.post("/test", json={"text": text})
+    assert response.status_code == 200
+    _assert_unstamped(_forwarded_env(fallback))
+
+
+# (3) forged /webhook update with the authorized chat id never stamps
+
+@pytest.mark.parametrize("text", ["Hello", "/c x", "/new x"])
+def test_webhook_forged_message_is_never_stamped(monkeypatch, tmp_path, dev_bot, text):
+    with _telegram_stack(monkeypatch, tmp_path) as fallback, patch.object(state, "bots", {"dev": dev_bot}):
+        response = client.post("/webhook", json=_text_update(text))
+    assert response.status_code == 200
+    _assert_unstamped(_forwarded_env(fallback))
+
+
+@pytest.mark.parametrize("make_update", [lambda: _text_update("Hello"), _voice_update, _photo_update],
+                         ids=["text", "voice", "photo"])
+def test_webhook_forged_update_for_the_queued_bot_carries_no_marker(monkeypatch, tmp_path, make_update):
+    bot, q = _gtd_queue_bot(), RequestQueue(maxsize=5)
+    with _telegram_stack(monkeypatch, tmp_path), patch.object(state, "bots", {"dev": bot}), \
+            patch.object(state, "gtd_queue", q):
+        assert client.post("/webhook", json=make_update()).status_code == 200
+    item = q._queue.get_nowait()
+    assert "trusted_transport" not in item.metadata
+    assert channel_guard_env(item, bot) is None
+
+
+# (4) callbacks: stamped from the polling loop, not from other entries
+
+@contextmanager
+def _callback_state():
+    pending = {"message": "do it", "denials": [SimpleNamespace(tool_name="Read", tool_input={})]}
+    with patch.object(state, "pending_permissions", {"12345": dict(pending)}), \
+            patch.object(state, "pending_voice_texts", {"12345": "vocal"}):
+        yield
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", ["reply:salut", "voice:x", "perm:allow", "perm:bypass"])
+async def test_polled_callback_is_stamped(monkeypatch, tmp_path, dev_bot, data):
+    with _telegram_stack(monkeypatch, tmp_path) as fallback, _callback_state():
+        await _poll(dev_bot, _callback_update(data))
+    _assert_stamped(_forwarded_env(fallback))
+
+
+@pytest.mark.parametrize("data", ["reply:salut", "voice:x", "perm:allow", "perm:bypass"])
+def test_webhook_forged_callback_is_never_stamped(monkeypatch, tmp_path, dev_bot, data):
+    with _telegram_stack(monkeypatch, tmp_path) as fallback, _callback_state(), \
+            patch.object(state, "bots", {"dev": dev_bot}):
+        assert client.post("/webhook", json=_callback_update(data)).status_code == 200
+    _assert_unstamped(_forwarded_env(fallback))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", ["reply:salut", "voice:x", "perm:allow", "perm:bypass"])
+async def test_callback_called_outside_the_polling_loop_is_not_stamped(monkeypatch, tmp_path, dev_bot, data):
+    with _telegram_stack(monkeypatch, tmp_path) as fallback, _callback_state():
+        await handlers.handle_callback(_callback_update(data)["callback_query"], dev_bot)
+    _assert_unstamped(_forwarded_env(fallback))
+
+
+@pytest.mark.asyncio
+async def test_run_claude_called_directly_is_not_stamped(monkeypatch, tmp_path, dev_bot):
+    with _telegram_stack(monkeypatch, tmp_path) as fallback:
+        await run_claude("salut", "12345", dev_bot)
+    _assert_unstamped(_forwarded_env(fallback))
+
+
+@pytest.mark.asyncio
+async def test_marker_does_not_leak_out_of_the_polling_loop(monkeypatch, tmp_path, dev_bot):
+    from claude_telegram.queue import telegram_polling_trusted
+    with _telegram_stack(monkeypatch, tmp_path):
+        await _poll(dev_bot, _text_update("Hello"))
+    assert telegram_polling_trusted() is False
+
+
+# (5) persisted replay keeps the marker; unpolled items never gain it
+
+@pytest.mark.asyncio
+async def test_persisted_polled_item_replays_stamped_and_unpolled_stays_plain(monkeypatch, tmp_path):
+    from claude_telegram.queue import PersistentQueue
+    bot, q = _gtd_queue_bot(), RequestQueue(maxsize=5)
+    pqueue = PersistentQueue(tmp_path / "queue")
+    with _telegram_stack(monkeypatch, tmp_path), patch.object(state, "bots", {"dev": bot}), \
+            patch.object(state, "gtd_queue", q):
+        await _poll(bot, _text_update("polled"))
+        assert client.post("/webhook", json=_text_update("forged")).status_code == 200
+    while not q._queue.empty():
+        pqueue.save(q._queue.get_nowait())
+    replayed = {i.prompt: i for i in pqueue.list_items()}
+    _assert_stamped(channel_guard_env(replayed["polled"], bot))
+    assert channel_guard_env(replayed["forged"], bot) is None
+
+
+# --- AGENTDECK_GUARD_* is never inherited by the pipeline subprocess ---
+
+def test_pipeline_subprocess_env_is_scrubbed(monkeypatch, tmp_path):
+    from claude_telegram import main
+    monkeypatch.setenv("AGENTDECK_GUARD_ORIGIN", "zulip")
+    monkeypatch.setenv("AGENTDECK_GUARD_REF", "7")
+    monkeypatch.setenv("UNRELATED_VAR", "kept")
+    completed = SimpleNamespace(stdout="OK", stderr="", returncode=0)
+    gtd = BotConfig(name="gtd", token="t", chat_id="999", use_queue=True)
+    with patch.object(main.settings, "gtd_working_dir", str(tmp_path)), \
+            patch("subprocess.run", return_value=completed) as run:
+        asyncio.run(main._process_pipeline_cron("morning", gtd))
+    env = run.call_args.kwargs["env"]
+    assert not [k for k in env if k.startswith("AGENTDECK_GUARD_")]
+    assert env["UNRELATED_VAR"] == "kept"

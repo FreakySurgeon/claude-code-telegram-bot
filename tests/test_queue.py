@@ -571,6 +571,8 @@ async def test_named_topic_not_renamed(mock_bot, clear_provider_state):
 ZULIP_REF = ConversationRef("zulip", "stream:general", topic="Topic")
 TELEGRAM_REF = ConversationRef("telegram", "12345", thread_id=7)
 GUARD_KEYS = {"AGENTDECK_GUARD_ORIGIN", "AGENTDECK_GUARD_REF"}
+# Marker stamped on items created inside the authenticated polling loop.
+POLLED = {"trusted_transport": "telegram-polling"}
 
 
 @pytest.fixture
@@ -611,21 +613,29 @@ def test_guard_env_zulip_without_conversation_or_metadata(authorized_bot):
     assert _guard_env(QueueItem(prompt="x", source="zulip", conversation=ZULIP_REF), authorized_bot) is None
 
 
+def test_guard_env_zulip_item_with_a_non_zulip_conversation(authorized_bot):
+    item = QueueItem(prompt="x", source="zulip", conversation=TELEGRAM_REF,
+                     metadata={"inbound_message_id": "4242"})
+    assert _guard_env(item, authorized_bot) is None
+
+
 def test_guard_env_telegram_message_id_is_never_a_zulip_ref(authorized_bot):
     """conversations.py stamps inbound_message_id for every channel: a non-Zulip id must not become a Zulip ref."""
-    item = QueueItem(prompt="x", source="telegram", conversation=TELEGRAM_REF,
-                     metadata={"inbound_message_id": "99", "type": "telegram-conversation"})
+    meta = {"inbound_message_id": "99", "type": "telegram-conversation"}
+    item = QueueItem(prompt="x", source="telegram", conversation=TELEGRAM_REF, metadata={**meta, **POLLED})
     assert _guard_env(item, authorized_bot) is None  # no chat_id -> no telegram env either
     with_chat = QueueItem(prompt="x", source="telegram", chat_id="12345", conversation=TELEGRAM_REF,
-                          metadata={"inbound_message_id": "99", "type": "telegram-conversation"})
+                          metadata={**meta, **POLLED})
     env = _guard_env(with_chat, authorized_bot)
     assert env["AGENTDECK_GUARD_ORIGIN"] == "telegram"
     assert env["AGENTDECK_GUARD_REF"] != "99"
+    untrusted = QueueItem(prompt="x", source="telegram", chat_id="12345", conversation=TELEGRAM_REF, metadata=meta)
+    assert _guard_env(untrusted, authorized_bot) is None
 
 
-def test_guard_env_telegram_authorized_chat_gets_fresh_ref(authorized_bot):
+def test_guard_env_telegram_polled_authorized_chat_gets_fresh_ref(authorized_bot):
     import re
-    item = QueueItem(prompt="x", source="telegram", chat_id="12345")
+    item = QueueItem(prompt="x", source="telegram", chat_id="12345", metadata=dict(POLLED))
     first, second = _guard_env(item, authorized_bot), _guard_env(item, authorized_bot)
     for env in (first, second):
         assert set(env) == GUARD_KEYS
@@ -634,11 +644,60 @@ def test_guard_env_telegram_authorized_chat_gets_fresh_ref(authorized_bot):
     assert first["AGENTDECK_GUARD_REF"] != second["AGENTDECK_GUARD_REF"]
 
 
+def test_guard_env_telegram_needs_the_polling_marker(authorized_bot):
+    """Default OFF: an authorized chat id alone (e.g. from /webhook or /test) is not enough."""
+    assert _guard_env(QueueItem(prompt="x", source="telegram", chat_id="12345"), authorized_bot) is None
+    for meta in ({"trusted_transport": "webhook"}, {"trusted_transport": ""}, {"trusted_transport": True}):
+        item = QueueItem(prompt="x", source="telegram", chat_id="12345", metadata=meta)
+        assert _guard_env(item, authorized_bot) is None
+
+
 def test_guard_env_telegram_unauthorized_or_missing_chat(authorized_bot):
-    assert _guard_env(QueueItem(prompt="x", source="telegram", chat_id="99999"), authorized_bot) is None
-    assert _guard_env(QueueItem(prompt="x", source="telegram", chat_id=None), authorized_bot) is None
+    polled = dict(POLLED)
+    assert _guard_env(QueueItem(prompt="x", source="telegram", chat_id="99999", metadata=polled), authorized_bot) is None
+    assert _guard_env(QueueItem(prompt="x", source="telegram", chat_id=None, metadata=polled), authorized_bot) is None
     # A bot whose is_authorized does not return a real True never qualifies.
-    assert _guard_env(QueueItem(prompt="x", source="telegram", chat_id="12345"), MagicMock()) is None
+    assert _guard_env(QueueItem(prompt="x", source="telegram", chat_id="12345", metadata=polled), MagicMock()) is None
+
+
+def test_guard_env_marker_alone_does_not_stamp_other_sources(authorized_bot):
+    for source in ("cron", "email", "fitness", "calendar"):
+        item = QueueItem(prompt="x", source=source, chat_id="12345", metadata=dict(POLLED))
+        assert _guard_env(item, authorized_bot) is None
+
+
+def test_guard_env_telegram_retry_copy_keeps_the_marker_with_a_fresh_ref(authorized_bot):
+    item = QueueItem(prompt="x", source="telegram", chat_id="12345", metadata=dict(POLLED))
+    retry = item.as_retry("boom")
+    assert retry.metadata == POLLED
+    assert _guard_env(item, authorized_bot)["AGENTDECK_GUARD_REF"] != _guard_env(retry, authorized_bot)["AGENTDECK_GUARD_REF"]
+
+
+@pytest.mark.asyncio
+async def test_guard_env_telegram_escalated_copy_keeps_the_marker_with_a_fresh_ref(authorized_bot, clear_provider_state):
+    q = RequestQueue(maxsize=3)
+    item = QueueItem(prompt="x", source="telegram", chat_id="12345", metadata=dict(POLLED))
+    runner = _runner(ClaudeResult(text="Trop complexe.\n<!-- escalate:opus -->", permission_denials=[]))
+    await process_queue_item(item, runner, authorized_bot, queue=q, notifications=FakeNotifications())
+    first_ref = runner.run.call_args.kwargs["extra_env"]["AGENTDECK_GUARD_REF"]
+
+    escalated = await q.dequeue()
+    assert escalated.metadata["escalated"] is True and escalated.metadata["trusted_transport"] == "telegram-polling"
+    runner2 = _runner(ClaudeResult(text="ok", permission_denials=[]))
+    await process_queue_item(escalated, runner2, authorized_bot, notifications=FakeNotifications())
+    second = runner2.run.call_args.kwargs["extra_env"]
+    assert second["AGENTDECK_GUARD_ORIGIN"] == "telegram" and second["AGENTDECK_GUARD_REF"] != first_ref
+
+
+def test_guard_env_persisted_item_keeps_the_marker_and_never_invents_it(authorized_bot, tmp_path):
+    from claude_telegram.queue import PersistentQueue
+    pqueue = PersistentQueue(tmp_path / "queue")
+    pqueue.save(QueueItem(prompt="polled", source="telegram", chat_id="12345", metadata=dict(POLLED)))
+    pqueue.save(QueueItem(prompt="plain", source="telegram", chat_id="12345"))
+    replayed = {i.prompt: i for i in pqueue.list_items()}
+    assert _guard_env(replayed["polled"], authorized_bot)["AGENTDECK_GUARD_ORIGIN"] == "telegram"
+    assert replayed["plain"].metadata == {}
+    assert _guard_env(replayed["plain"], authorized_bot) is None
 
 
 @pytest.mark.parametrize("source", ["cron", "email", "fitness", "calendar"])
@@ -661,17 +720,16 @@ async def test_process_queue_item_forwards_zulip_env_to_the_runner(authorized_bo
 
 
 @pytest.mark.asyncio
-async def test_process_queue_item_forwards_telegram_env_only_when_authorized(authorized_bot, clear_provider_state):
-    runner = _runner(ClaudeResult(text="ok", permission_denials=[]))
-    await process_queue_item(QueueItem(prompt="x", source="telegram", chat_id="12345"), runner, authorized_bot,
-                             notifications=FakeNotifications())
-    env = runner.run.call_args.kwargs["extra_env"]
-    assert env["AGENTDECK_GUARD_ORIGIN"] == "telegram" and env["AGENTDECK_GUARD_REF"].startswith("telegram:")
+async def test_process_queue_item_forwards_telegram_env_only_when_polled_and_authorized(authorized_bot, clear_provider_state):
+    async def extra_env_for(item):
+        runner = _runner(ClaudeResult(text="ok", permission_denials=[]))
+        await process_queue_item(item, runner, authorized_bot, notifications=FakeNotifications())
+        return runner.run.call_args.kwargs["extra_env"]
 
-    runner = _runner(ClaudeResult(text="ok", permission_denials=[]))
-    await process_queue_item(QueueItem(prompt="x", source="telegram", chat_id="99999"), runner, authorized_bot,
-                             notifications=FakeNotifications())
-    assert runner.run.call_args.kwargs["extra_env"] is None
+    env = await extra_env_for(QueueItem(prompt="x", source="telegram", chat_id="12345", metadata=dict(POLLED)))
+    assert env["AGENTDECK_GUARD_ORIGIN"] == "telegram" and env["AGENTDECK_GUARD_REF"].startswith("telegram:")
+    assert await extra_env_for(QueueItem(prompt="x", source="telegram", chat_id="12345")) is None
+    assert await extra_env_for(QueueItem(prompt="x", source="telegram", chat_id="99999", metadata=dict(POLLED))) is None
 
 
 @pytest.mark.asyncio
@@ -680,3 +738,69 @@ async def test_process_queue_item_cron_has_no_guard_env(authorized_bot, clear_pr
     runner = _runner(ClaudeResult(text="ok", permission_denials=[]))
     await process_queue_item(item, runner, authorized_bot, notifications=FakeNotifications())
     assert runner.run.call_args.kwargs["extra_env"] is None
+
+
+# --- Trusted transport marker (ContextVar -> item.metadata) ---
+
+def test_trusted_transport_metadata_is_empty_by_default():
+    from claude_telegram.queue import telegram_polling_trusted, trusted_transport_metadata
+    assert trusted_transport_metadata() == {}
+    assert telegram_polling_trusted() is False
+
+
+def test_trusted_transport_marker_is_scoped_to_the_block():
+    from claude_telegram.queue import (TELEGRAM_POLLING, telegram_polling_trusted, trusted_transport,
+                                       trusted_transport_metadata)
+    with trusted_transport(TELEGRAM_POLLING):
+        assert telegram_polling_trusted() is True
+        assert trusted_transport_metadata() == POLLED
+    assert telegram_polling_trusted() is False
+    assert trusted_transport_metadata() == {}
+
+
+def test_trusted_transport_marker_resets_even_when_the_block_raises():
+    from claude_telegram.queue import TELEGRAM_POLLING, telegram_polling_trusted, trusted_transport
+    with pytest.raises(RuntimeError):
+        with trusted_transport(TELEGRAM_POLLING):
+            raise RuntimeError("boom")
+    assert telegram_polling_trusted() is False
+
+
+@pytest.mark.asyncio
+async def test_trusted_transport_is_inherited_by_tasks_spawned_inside_and_not_by_others():
+    from claude_telegram.queue import TELEGRAM_POLLING, telegram_polling_trusted, trusted_transport
+
+    async def probe():
+        return telegram_polling_trusted()
+
+    outside = asyncio.create_task(probe())
+    with trusted_transport(TELEGRAM_POLLING):
+        inside = asyncio.create_task(probe())
+        assert await inside is True
+    assert await outside is False
+    assert await asyncio.create_task(probe()) is False
+
+
+@pytest.mark.asyncio
+async def test_marker_is_read_at_enqueue_time_and_survives_to_the_worker_task(authorized_bot, clear_provider_state):
+    """The queue worker runs in another task: the marker must travel on the item, not in the context."""
+    from claude_telegram.queue import TELEGRAM_POLLING, trusted_transport, trusted_transport_metadata
+    q = RequestQueue(maxsize=3)
+    with trusted_transport(TELEGRAM_POLLING):
+        await q.enqueue(QueueItem(prompt="in", source="telegram", chat_id="12345",
+                                  metadata=trusted_transport_metadata()))
+    await q.enqueue(QueueItem(prompt="out", source="telegram", chat_id="12345",
+                              metadata=trusted_transport_metadata()))
+
+    async def worker():
+        seen = {}
+        for _ in range(2):
+            item = await q.dequeue()
+            runner = _runner(ClaudeResult(text="ok", permission_denials=[]))
+            await process_queue_item(item, runner, authorized_bot, notifications=FakeNotifications())
+            seen[item.prompt] = runner.run.call_args.kwargs["extra_env"]
+        return seen
+
+    seen = await asyncio.create_task(worker())  # separate task, context without the marker
+    assert seen["in"]["AGENTDECK_GUARD_ORIGIN"] == "telegram"
+    assert seen["out"] is None

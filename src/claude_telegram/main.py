@@ -70,7 +70,7 @@ def _load_post_session_prompt() -> str | None:
         return None
 
 from .adapters.telegram import api as telegram  # bot bootstrap only (getMe, webhook)
-from .claude import sessions
+from .claude import scrubbed_environ, sessions
 from .config import settings
 from .tunnel import tunnel, CloudflareTunnel
 from .queue import QueueItem, RequestQueue, process_queue_item, PersistentQueue, ApiStatus
@@ -942,7 +942,7 @@ async def _process_pipeline_cron(reminder_type: str, bot: BotConfig):
             lambda: sp.run(
                 ["python3", f"{working_dir}/scripts/run_pipeline.py", reminder_type],
                 capture_output=True, text=True, timeout=pipeline_timeout,
-                cwd=working_dir,
+                cwd=working_dir, env=scrubbed_environ(),
             ),
         )
         output = proc.stdout.strip()

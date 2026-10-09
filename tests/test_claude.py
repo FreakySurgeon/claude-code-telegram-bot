@@ -416,6 +416,39 @@ async def test_extra_env_cannot_displace_the_path_prepend(runner, mock_process, 
     assert env["PATH"] == "/opt/shim:/evil:/usr/bin"
 
 
+@pytest.mark.asyncio
+async def test_inherited_guard_env_is_scrubbed_when_no_extra_env(runner, mock_process, monkeypatch):
+    monkeypatch.setenv("AGENTDECK_GUARD_ORIGIN", "zulip")
+    monkeypatch.setenv("AGENTDECK_GUARD_REF", "7")
+    monkeypatch.setenv("AGENTDECK_GUARD_FUTURE", "x")
+    monkeypatch.setenv("UNRELATED_VAR", "kept")
+    env = await _captured_env(runner, mock_process)
+    assert not [k for k in env if k.startswith("AGENTDECK_GUARD_")]
+    assert env["UNRELATED_VAR"] == "kept"
+
+
+@pytest.mark.asyncio
+async def test_inherited_guard_env_is_replaced_by_extra_env(runner, mock_process, monkeypatch):
+    monkeypatch.setenv("AGENTDECK_GUARD_ORIGIN", "zulip")
+    monkeypatch.setenv("AGENTDECK_GUARD_REF", "7")
+    env = await _captured_env(
+        runner, mock_process,
+        extra_env={"AGENTDECK_GUARD_ORIGIN": "telegram", "AGENTDECK_GUARD_REF": "telegram:" + "a" * 32},
+    )
+    assert env["AGENTDECK_GUARD_ORIGIN"] == "telegram"
+    assert env["AGENTDECK_GUARD_REF"] == "telegram:" + "a" * 32
+
+
+def test_scrubbed_environ_drops_only_the_guard_prefix(monkeypatch):
+    from claude_telegram.claude import scrubbed_environ
+    monkeypatch.setenv("AGENTDECK_GUARD_ORIGIN", "zulip")
+    monkeypatch.setenv("AGENTDECK_OTHER", "kept")
+    monkeypatch.setenv("MY_AGENTDECK_GUARD_X", "kept")
+    env = scrubbed_environ()
+    assert "AGENTDECK_GUARD_ORIGIN" not in env
+    assert env["AGENTDECK_OTHER"] == "kept" and env["MY_AGENTDECK_GUARD_X"] == "kept"
+
+
 # --- SessionManager hierarchical tests ---
 
 from claude_telegram.claude import SessionManager

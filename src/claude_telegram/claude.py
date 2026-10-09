@@ -298,6 +298,18 @@ def get_session_permission_mode(working_dir: str) -> str | None:
     return None
 
 
+GUARD_ENV_PREFIX = "AGENTDECK_GUARD_"
+
+
+def scrubbed_environ() -> dict[str, str]:
+    """Copy of ``os.environ`` without any ``AGENTDECK_GUARD_*`` variable.
+
+    Channel provenance is set per run from the authenticated channel, never
+    inherited from the service environment (.env, systemd, shell).
+    """
+    return {k: v for k, v in os.environ.items() if not k.startswith(GUARD_ENV_PREFIX)}
+
+
 def _prepend_to_path(env: dict[str, str], directory: str | None) -> None:
     """Put one absolute directory first in env["PATH"] (no-op if unusable or already first).
 
@@ -469,7 +481,7 @@ class ClaudeRunner:
         cwd = Path(self.working_dir) if self.working_dir else None
 
         # Set environment variable to prevent hook from sending duplicate notifications
-        env = os.environ.copy()
+        env = scrubbed_environ()
         env["CLAUDE_TELEGRAM_BOT"] = "1"
         for key, value in (provider_env or {}).items():
             if value is None:

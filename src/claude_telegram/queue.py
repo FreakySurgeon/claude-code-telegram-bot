@@ -1,12 +1,14 @@
 """Request queue for serializing Claude requests."""
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
 import re
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -294,6 +296,41 @@ def _default_notifications(bot):
     return NotificationService(RoutingPolicy.default(), {"telegram": TelegramOutbound({bot.name: bot})})
 
 
+# --- Trusted transport (opt-in, default OFF) ---------------------------------
+# Telegram provenance is stamped only for updates that arrived through the
+# bot-token-authenticated long-poll loop. The HTTP entry points (/webhook,
+# /test, ...) are not authenticated, so they never carry this marker. The
+# marker is a ContextVar set around the polling dispatch; it is read when the
+# QueueItem is created and stored in item.metadata, because the queue worker
+# runs in another task (and items can be persisted and replayed).
+TRUSTED_TRANSPORT_KEY = "trusted_transport"
+TELEGRAM_POLLING = "telegram-polling"
+_trusted_transport: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "trusted_transport", default=None
+)
+
+
+@contextmanager
+def trusted_transport(name: str):
+    """Mark everything dispatched inside the block as coming from an authenticated transport."""
+    token = _trusted_transport.set(name)
+    try:
+        yield
+    finally:
+        _trusted_transport.reset(token)
+
+
+def telegram_polling_trusted() -> bool:
+    """True only inside the polling dispatch (and tasks spawned from it)."""
+    return _trusted_transport.get() == TELEGRAM_POLLING
+
+
+def trusted_transport_metadata() -> dict[str, str]:
+    """Metadata to put on a QueueItem created now: the transport marker, or nothing."""
+    name = _trusted_transport.get()
+    return {TRUSTED_TRANSPORT_KEY: name} if name else {}
+
+
 def new_telegram_guard_env() -> dict[str, str]:
     """Channel-provenance env for a run triggered by an authorized Telegram chat.
 
@@ -307,7 +344,9 @@ def channel_guard_env(item: "QueueItem", bot) -> dict[str, str] | None:
 
     - Zulip conversation: ref = the inbound Zulip message id (digits only), so
       the gateway can re-read that message through the Zulip API.
-    - Telegram: only when the chat is authorized for this bot; fresh ref per run.
+    - Telegram: only when the item was created inside the authenticated polling
+      loop (``metadata["trusted_transport"] == "telegram-polling"``) AND the chat
+      is authorized for this bot; fresh ref per run (retries/escalations too).
     Any other source (cron, email, fitness, calendar...) gets no env at all.
     """
     if item.source == "zulip":
@@ -318,7 +357,8 @@ def channel_guard_env(item: "QueueItem", bot) -> dict[str, str] | None:
             return None
         return {"AGENTDECK_GUARD_ORIGIN": "zulip", "AGENTDECK_GUARD_REF": inbound_id}
     if item.source == "telegram":
-        if item.chat_id and bot.is_authorized(item.chat_id) is True:
+        trusted = (item.metadata or {}).get(TRUSTED_TRANSPORT_KEY) == TELEGRAM_POLLING
+        if trusted and item.chat_id and bot.is_authorized(item.chat_id) is True:
             return new_telegram_guard_env()
     return None
 

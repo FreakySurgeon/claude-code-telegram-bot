@@ -23,7 +23,14 @@ from ...claude import (
 )
 from ...config import settings
 from ...markdown import split_text
-from ...queue import QueueItem, new_telegram_guard_env
+from ...queue import (
+    QueueItem,
+    TELEGRAM_POLLING,
+    new_telegram_guard_env,
+    telegram_polling_trusted,
+    trusted_transport,
+    trusted_transport_metadata,
+)
 from ...topic import (
     extract_title_from_response,
     format_topic_name,
@@ -89,10 +96,13 @@ async def poll_updates(bot: BotConfig):
             for update in updates:
                 offset = update["update_id"] + 1
 
-                if "message" in update:
-                    await handle_message(update["message"], bot)
-                elif "callback_query" in update:
-                    await handle_callback(update["callback_query"], bot)
+                # Long-poll updates are authenticated by the bot token: the only
+                # transport allowed to carry channel provenance for the agent.
+                with trusted_transport(TELEGRAM_POLLING):
+                    if "message" in update:
+                        await handle_message(update["message"], bot)
+                    elif "callback_query" in update:
+                        await handle_callback(update["callback_query"], bot)
 
         except asyncio.CancelledError:
             logger.info(f"Polling stopped for bot '{bot.name}'")
@@ -103,7 +113,10 @@ async def poll_updates(bot: BotConfig):
 
 
 async def handle_update(update: dict, bot: BotConfig):
-    """Dispatch a single Telegram update (from webhook or polling) to a handler."""
+    """Dispatch a single Telegram update received over HTTP (/webhook) to a handler.
+
+    Unauthenticated transport: no channel provenance is attached (see ``poll_updates``).
+    """
     if "message" in update:
         await handle_message(update["message"], bot)
     elif "callback_query" in update:
@@ -174,6 +187,7 @@ async def handle_message(message: dict, bot: BotConfig):
             continue_session=continue_session,
             new_session=topic_just_created,
             thread_id=thread_id,
+            metadata=trusted_transport_metadata(),
         )
         added = await state.gtd_queue.enqueue(item)
         if not added:
@@ -427,6 +441,7 @@ async def handle_voice(message: dict, bot: BotConfig, *, thread_id: int | None =
                     continue_session=False,
                     new_session=topic_just_created,
                     thread_id=thread_id,
+                    metadata=trusted_transport_metadata(),
                 )
                 added = await state.gtd_queue.enqueue(item)
                 if not added:
@@ -524,6 +539,7 @@ async def handle_photo(message: dict, bot: BotConfig, *, thread_id: int | None =
                 continue_session=continue_session,
                 new_session=topic_just_created,
                 thread_id=thread_id,
+                metadata=trusted_transport_metadata(),
             )
             added = await state.gtd_queue.enqueue(item)
             if not added:
@@ -1216,8 +1232,10 @@ async def run_claude(
             animate_status(chat_id, message_id, continue_session, session_name, api_url=bot.api_url, message_thread_id=thread_id)
         )
 
-    # Channel provenance for the agent: authorized chats only, fresh ref per run.
-    guard_env = new_telegram_guard_env() if bot.is_authorized(chat_id) is True else None
+    # Channel provenance for the agent: authenticated polling + authorized chat, fresh ref per run.
+    guard_env = (
+        new_telegram_guard_env() if telegram_polling_trusted() and bot.is_authorized(chat_id) is True else None
+    )
 
     try:
         from ...providers import run_with_fallback, telegram_notifier
