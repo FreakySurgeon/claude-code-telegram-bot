@@ -21,8 +21,14 @@ class TestMarkdownToTelegramHtml:
 
     def test_escapes_html_entities(self):
         """Test HTML entities are escaped."""
+        result = markdown_to_telegram_html("Tom & Jerry")
+        assert result == "Tom &amp; Jerry"
+
+    def test_strips_unknown_tags(self):
+        """XML-like tags are dropped (not escaped), their text is kept."""
         result = markdown_to_telegram_html("Use <div> and & symbols")
-        assert "&lt;div&gt;" in result
+        assert "<div>" not in result
+        assert "&lt;div&gt;" not in result
         assert "&amp;" in result
 
     def test_code_blocks(self):

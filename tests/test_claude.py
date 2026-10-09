@@ -73,15 +73,31 @@ async def test_run_basic_message(runner, mock_process):
 
 @pytest.mark.asyncio
 async def test_run_with_continue(runner, mock_process):
-    """Test running Claude with --continue flag."""
+    """No stored session on disk: continue_session falls back to --continue."""
     mock_process.stdout = async_iter(make_stream_json("Continued response"))
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec:
+    with patch("claude_telegram.claude.find_latest_session", return_value=None), \
+            patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec:
         result = await runner.run("Continue this", continue_session=True)
 
         assert "Continued response" in result.text
         call_args = mock_exec.call_args[0]
         assert "--continue" in call_args
+        assert "--resume" not in call_args
+
+
+@pytest.mark.asyncio
+async def test_run_with_continue_resumes_stored_session(runner, mock_process):
+    """A stored session on disk is resumed by id instead of --continue."""
+    mock_process.stdout = async_iter(make_stream_json("Resumed response"))
+
+    with patch("claude_telegram.claude.find_latest_session", return_value="stored-session"), \
+            patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec:
+        await runner.run("Continue this", continue_session=True)
+
+        call_args = list(mock_exec.call_args[0])
+        assert call_args[call_args.index("--resume") + 1] == "stored-session"
+        assert "--continue" not in call_args
 
 
 @pytest.mark.asyncio
@@ -153,7 +169,8 @@ async def test_compact(runner, mock_process):
     """Test running compaction."""
     mock_process.stdout = async_iter(make_stream_json("Compaction complete"))
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec:
+    with patch("claude_telegram.claude.find_latest_session", return_value=None), \
+            patch("asyncio.create_subprocess_exec", return_value=mock_process) as mock_exec:
         result = await runner.compact()
 
         assert "Compaction complete" in result.text
