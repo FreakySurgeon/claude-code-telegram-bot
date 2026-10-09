@@ -119,3 +119,58 @@ async def test_progress_roundtrip(outs):
     handle = await svc.start_progress(ref, inbound_message_id="5")
     await svc.stop_progress(handle, ok=False)
     assert outs["zulip"].progress == [("start", ref, {"inbound_message_id": "5"}), ("stop", "h", False)]
+
+
+MIRROR_CFG = dict(CFG, mirror={"briefing_morning": ["telegram"]})
+BRIEFING = "Détail complet\n\n<!-- summary -->\n☀️ 3 priorités\n<!-- /summary -->"
+
+
+async def test_mirror_sends_summary_to_telegram_and_full_body_to_zulip(outs):
+    svc = NotificationService(RoutingPolicy(MIRROR_CFG), outs)
+    deliveries = await svc.publish(Event("briefing_morning", "normal", title="Cron: morning", body=BRIEFING))
+    assert [d.channel for d in deliveries] == ["zulip", "telegram"]
+    assert outs["zulip"].sent[0][1] == "Détail complet"
+    assert outs["telegram"].sent[0][1] == "☀️ 3 priorités"
+
+
+async def test_mirror_opens_the_chat_root_never_a_topic(outs):
+    svc = NotificationService(RoutingPolicy(MIRROR_CFG), outs)
+    await svc.publish(Event("briefing_morning", "normal", title="Cron: morning", body=BRIEFING))
+    assert outs["telegram"].opened == [({"bot": "gtd"}, "", False)]
+
+
+async def test_mirror_truncates_when_there_is_no_summary_block(outs):
+    svc = NotificationService(RoutingPolicy(MIRROR_CFG), outs)
+    await svc.publish(Event("briefing_morning", "normal", body="\n".join(f"ligne {i}" for i in range(2000))))
+    short = outs["telegram"].sent[0][1]
+    assert 0 < len(short) <= 1200 and short.endswith("…")
+    assert len(outs["zulip"].sent[0][1]) > 1200
+
+
+async def test_mirror_still_reaches_telegram_when_the_primary_channel_is_down(outs):
+    outs["zulip"].fail = True
+    svc = NotificationService(RoutingPolicy(MIRROR_CFG), outs)
+    deliveries = await svc.publish(Event("briefing_morning", "normal", body=BRIEFING))
+    assert deliveries[0].error and deliveries[1].error is None
+    assert outs["telegram"].sent[0][1] == "☀️ 3 priorités"
+
+
+async def test_mirror_ignores_a_conversation_hint_of_the_same_channel(outs):
+    svc = NotificationService(RoutingPolicy(MIRROR_CFG), outs)
+    hint = ConversationRef("telegram", "42", thread_id=9)
+    await svc.publish(Event("briefing_morning", "normal", body=BRIEFING, conversation_hint=hint))
+    assert outs["telegram"].sent[0][0] != hint
+    assert outs["telegram"].opened == [({"bot": "gtd"}, "", False)]
+
+
+async def test_summary_block_is_stripped_even_without_a_mirror(outs):
+    svc = NotificationService(RoutingPolicy(CFG), outs)
+    await svc.publish(Event("briefing_morning", "normal", body=BRIEFING))
+    assert outs["zulip"].sent[0][1] == "Détail complet"
+    assert outs["telegram"].sent == []
+
+
+async def test_non_mirrored_events_keep_their_body_verbatim(outs):
+    svc = NotificationService(RoutingPolicy(MIRROR_CFG), outs)
+    await svc.publish(Event("whatsapp_triage", "normal", body="  corps brut  \n"))
+    assert outs["zulip"].sent[0][1] == "  corps brut  \n"

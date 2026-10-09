@@ -13,6 +13,7 @@ from typing import Any, Sequence
 
 from .ports import Action, Attachment, ConversationRef, Event, OutboundChannel
 from .routing import RoutingPolicy
+from .summary import split_summary, truncate_summary
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class NotificationService:
 
     async def publish(self, event: Event) -> list[Delivery]:
         deliveries: list[Delivery] = []
+        full_body, summary = split_summary(event.body)
         for route in self.policy.route(event):
             out = self._outbounds.get(route.channel)
             if out is None:
@@ -46,12 +48,17 @@ class NotificationService:
                 continue
             ref = None
             try:
-                hint = event.conversation_hint
-                if hint is not None and hint.channel == route.channel:
-                    ref = hint
+                if route.mirror:
+                    # Short copy in the channel root: no topic per mirrored event.
+                    ref = await out.open_conversation(route.target, "")
+                    ids = await out.send(ref, summary or truncate_summary(full_body))
                 else:
-                    ref = await out.open_conversation(route.target, event.title)
-                ids = await out.send(ref, event.body, attachments=event.attachments, actions=event.actions)
+                    hint = event.conversation_hint
+                    if hint is not None and hint.channel == route.channel:
+                        ref = hint
+                    else:
+                        ref = await out.open_conversation(route.target, event.title)
+                    ids = await out.send(ref, full_body, attachments=event.attachments, actions=event.actions)
                 deliveries.append(Delivery(route.channel, ref, list(ids or [])))
             except Exception as exc:  # noqa: BLE001 — one channel must not break the others
                 logger.exception("Delivery of %s/%s to %s failed", event.type, event.severity, route.channel)

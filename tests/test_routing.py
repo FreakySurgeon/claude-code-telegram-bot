@@ -122,3 +122,46 @@ def test_event_type_for_pipelines():
     assert event_type_for("morning") == "briefing_morning"
     assert event_type_for("zulip") == "zulip_fallback"
     assert event_type_for("new-thing") == "new_thing"
+
+
+MIRROR_CFG = dict(CFG, mirror={"briefing_morning": ["telegram"], "briefing_evening": "telegram"})
+
+
+def test_mirror_adds_channel_despite_only_severity():
+    assert RoutingPolicy(MIRROR_CFG).route(Event("briefing_morning", "normal")) == [
+        ChannelRef("zulip", {"stream": "s", "topic": "Briefing matin"}),
+        ChannelRef("telegram", {"bot": "gtd"}, mirror=True),
+    ]
+
+
+def test_mirror_accepts_a_single_channel_name():
+    routes = RoutingPolicy(MIRROR_CFG).route(Event("briefing_evening", "info"))
+    assert [(r.channel, r.mirror) for r in routes] == [("zulip", False), ("telegram", True)]
+
+
+def test_mirror_leaves_other_event_types_alone():
+    p = RoutingPolicy(MIRROR_CFG)
+    for etype in ("whatsapp_triage", "enrichment", "email_triage"):
+        assert [r.channel for r in p.route(Event(etype, "normal"))] == ["zulip"]
+
+
+def test_mirror_does_not_duplicate_an_urgent_event():
+    routes = RoutingPolicy(MIRROR_CFG).route(Event("briefing_morning", "urgent"))
+    assert [(r.channel, r.mirror) for r in routes] == [("telegram", False), ("zulip", False)]
+
+
+def test_mirror_does_not_apply_to_dev_events():
+    cfg = dict(CFG, mirror={"dev.completed": ["zulip"]})
+    assert RoutingPolicy(cfg).route(Event("dev.completed")) == [ChannelRef("telegram", {"bot": "dev"})]
+
+
+def test_channels_property_includes_mirror_channels():
+    cfg = {"default": "zulip", "zulip": {}, "mirror": {"briefing_morning": ["telegram"]}}
+    assert RoutingPolicy(cfg).channels == {"zulip", "telegram"}
+
+
+def test_example_file_mirrors_the_briefings():
+    p = RoutingPolicy.from_file(Path(__file__).parent.parent / "routing.example.yaml")
+    assert [(r.channel, r.mirror) for r in p.route(Event("briefing_morning", "normal"))] == [
+        ("zulip", False), ("telegram", True)]
+    assert [r.channel for r in p.route(Event("email_triage", "normal"))] == ["zulip"]

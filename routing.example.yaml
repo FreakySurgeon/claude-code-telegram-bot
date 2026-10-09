@@ -8,10 +8,19 @@
 #   urgent -> every channel in `urgent`
 #   normal / info -> the `default` channel
 # A channel's `only_severity` list drops everything else for that channel.
+#
+# `mirror` adds a short copy of chosen event types to extra channels, whatever
+# their severity (it bypasses `only_severity`). The copy goes to the channel
+# root (never a new topic) and contains the block the producer wrapped in
+# <!-- summary -->...<!-- /summary -->, or else the first ~1200 characters of
+# the body. Other channels receive the body without that block.
 
 channels:
   default: zulip              # conversations + information
   urgent: [telegram, zulip]   # urgent: Telegram, plus a copy in Zulip for history
+  mirror:                     # event type -> extra channels (short copy)
+    briefing_morning: [telegram]
+    briefing_evening: [telegram]
 
   zulip:
     site: ${ZULIP_SITE}

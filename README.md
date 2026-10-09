@@ -247,7 +247,11 @@ outside `adapters/` imports Telegram code.
 - **Outbound**: crons, webhooks and `/notify/{event_type}` build an `Event`
   (type, severity, title, body). The `RoutingPolicy` sends `urgent` events to
   every channel listed in `urgent` and the rest to `default`; a channel's
-  `only_severity` drops everything else for that channel.
+  `only_severity` drops everything else for that channel. The optional
+  `mirror` map (`event type -> [channels]`) adds a short copy of chosen event
+  types to extra channels regardless of severity: the block a producer wrapped
+  in `<!-- summary -->…<!-- /summary -->` (else the first ~1200 characters),
+  posted in the channel root, never in a new topic.
 - **Inbound (Zulip)**: an event-queue long-poll listens to `listen_streams`
   (every message), `mention_streams` (on @mention) and DMs. One topic = one
   Claude session (idle TTL `session_ttl_hours`). The event cursor is stored in

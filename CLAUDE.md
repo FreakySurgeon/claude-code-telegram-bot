@@ -45,7 +45,9 @@ in `adapters/telegram/` and `adapters/zulip/`; `main.py` is the composition root
   Unset = everything to Telegram (legacy behaviour).
 - Crons/webhooks/`/notify/{event_type}` publish an `Event`; severity `urgent`
   → `urgent` list, else `default`; `only_severity` filters per channel;
-  `dev.*` events → dev bot.
+  `dev.*` events → dev bot. `mirror: {event_type: [channels]}` adds a short copy
+  (`summary.py`: `<!-- summary -->` block or truncation, channel root, no topic)
+  that bypasses `only_severity`; other channels get the body minus that block.
 - Zulip inbound = event-queue long-poll (cursor `$DATA_DIR/zulip-events.json`),
   one topic = one Claude session (`$DATA_DIR/channel-sessions.json`, TTL).
 - `POST /webhook/zulip` = safety net: when the inbound runs, a payload is

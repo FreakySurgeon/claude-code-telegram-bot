@@ -73,6 +73,7 @@ class ChannelRef:
 
     channel: str
     target: dict = field(default_factory=dict, hash=False)
+    mirror: bool = False  # extra copy (short form, chat root) added by the ``mirror`` map
 
 
 def expand_env(value: Any, env: Mapping[str, str]) -> Any:
@@ -129,8 +130,15 @@ class RoutingPolicy:
     @property
     def channels(self) -> set[str]:
         names = {self.default_channel, *self.config.get("urgent", [])}
-        names.update(k for k, v in self.config.items() if isinstance(v, dict))
+        names.update(k for k, v in self.config.items() if isinstance(v, dict) and k != "mirror")
+        for event_type in self.config.get("mirror") or {}:
+            names.update(self.mirror_channels(event_type))
         return names
+
+    def mirror_channels(self, event_type: str) -> list[str]:
+        """Channels that get an extra short copy of ``event_type``, whatever its severity."""
+        names = (self.config.get("mirror") or {}).get(event_type) or []
+        return [names] if isinstance(names, str) else list(names)
 
     def channel_config(self, name: str) -> dict:
         cfg = self.config.get(name)
@@ -166,4 +174,9 @@ class RoutingPolicy:
             if only and event.severity not in only:
                 continue
             routes.append(ChannelRef(channel, self._target(channel, event)))
+        for channel in self.mirror_channels(event.type):
+            if channel in seen:
+                continue
+            seen.add(channel)
+            routes.append(ChannelRef(channel, self._target(channel, event), mirror=True))
         return routes
