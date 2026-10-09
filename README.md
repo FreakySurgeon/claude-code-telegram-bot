@@ -237,6 +237,7 @@ Bot: 📂 Switched to api
 | `WEBHOOK_URL` | (none) | Your public URL (webhook mode only) |
 | `CHANNEL_ROUTING_PATH` | (none) | YAML file with a `channels:` block (see `routing.example.yaml`). Unset = everything goes to Telegram |
 | `CHANNEL_ENV_FILE` | (none) | Optional dotenv file used to expand `${VAR}` placeholders in the routing file |
+| `GTD_PATH_PREPEND` | (none) | Absolute directory prefixed to the `PATH` of the engine subprocess (e.g. a directory holding wrapper executables). Empty, relative or multi-entry values are ignored |
 
 ## Channels (ports & adapters)
 
@@ -261,6 +262,28 @@ outside `adapters/` imports Telegram code.
   the queue has not seen the message after 2 minutes.
 - **Local testing**: `POST /channels/inject` (loopback + `X-Webhook-Secret`)
   publishes an `Event` or feeds an inbound message through the core.
+
+### Engine environment: channel provenance and PATH
+
+Each engine run gets an environment built from the service environment plus a
+few per-run additions:
+
+- **Provenance stamps.** `AGENTDECK_GUARD_ORIGIN` and `AGENTDECK_GUARD_REF` tell
+  tooling running inside the session which authenticated channel the request
+  came from. They are set only for:
+  - Zulip conversation items (`origin=zulip`, `ref` = the inbound message id);
+  - Telegram items received through the authenticated polling loop
+    (`MODE=polling`, chat authorized for the bot; `origin=telegram`, `ref` = a
+    fresh `telegram:<uuid4 hex>` per run).
+- **No stamp otherwise (fail-closed).** Nothing is stamped for `/test`,
+  `/webhook`, other HTTP commands, crons, e-mail or other automated sources, nor
+  for Telegram items in `tunnel` or `webhook` mode. A consumer of the stamps
+  must treat a missing origin as "not an authenticated request".
+- **Scrubbed from inherited env.** Every `AGENTDECK_GUARD_*` variable of the
+  service environment (`.env`, systemd, shell) is removed before the stamps are
+  added, so provenance can never be inherited, only set per run by the code above.
+- **`GTD_PATH_PREPEND`.** If set to a single absolute directory, it is put first
+  in the engine `PATH`.
 
 ## Docker
 
