@@ -1,5 +1,7 @@
 """Tests for FastAPI main application."""
 
+import logging
+
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from fastapi.testclient import TestClient
@@ -919,3 +921,18 @@ def test_pipeline_subprocess_env_is_scrubbed(monkeypatch, tmp_path):
     env = run.call_args.kwargs["env"]
     assert not [k for k in env if k.startswith("AGENTDECK_GUARD_")]
     assert env["UNRELATED_VAR"] == "kept"
+
+
+def test_httpx_logger_never_logs_request_urls_at_info():
+    import subprocess
+    import sys
+
+    probe = (
+        "import logging, claude_telegram.main;"
+        "print(logging.getLogger('httpx').getEffectiveLevel(),"
+        " logging.getLogger('httpcore').getEffectiveLevel())"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    ).stdout.split()[-2:]
+    assert all(int(level) >= logging.WARNING for level in out)
