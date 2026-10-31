@@ -420,6 +420,26 @@ def test_notify_custom():
     assert fake.events[0].type == "dev.custom_event"
 
 
+def test_notify_urgent_text_published_as_urgent_dev_event():
+    bot = _make_dev_bot()
+    fake = FakeNotifications()
+    with patch.object(state, "bots", {"dev": bot}), patch.object(state, "notifications", fake):
+        response = client.post("/notify/brainstorm", json={"text": "x", "severity": "urgent"})
+    assert response.json()["ok"] is True
+    [event] = fake.events
+    assert event.type == "dev.brainstorm"
+    assert event.severity == "urgent"
+    assert event.body == "x"
+
+
+def test_notify_unknown_severity_falls_back_to_info():
+    bot = _make_dev_bot()
+    fake = FakeNotifications()
+    with patch.object(state, "bots", {"dev": bot}), patch.object(state, "notifications", fake):
+        client.post("/notify/brainstorm", json={"text": "x", "severity": "bogus"})
+    assert fake.events[0].severity == "info"
+
+
 def test_notify_fitness_opens_conversation_and_enqueues():
     from claude_telegram.ports import ConversationRef
 

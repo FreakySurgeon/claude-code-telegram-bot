@@ -370,15 +370,20 @@ async def notify(event_type: str, request: Request):
     summary = None
     working_dir = None
     session_id = None
+    text = None
+    severity = "info"
     try:
         data = await request.json()
         summary = data.get("summary")
+        text = data.get("text") or None
+        if data.get("severity") in ("urgent", "normal", "info"):
+            severity = data["severity"]
         working_dir = data.get("working_dir")
         session_id = data.get("session_id")
     except Exception:
         pass
 
-    logger.info(f"notify/{event_type}: working_dir={working_dir}, session_id={session_id}, has_summary={summary is not None}")
+    logger.info(f"notify/{event_type}: working_dir={working_dir}, session_id={session_id}, has_summary={summary is not None}, has_text={text is not None}, severity={severity}")
 
     # --- Fitness debrief: enqueue in GTD queue for full skill-based debrief ---
     if event_type == "fitness-completed" and summary:
@@ -451,7 +456,10 @@ async def notify(event_type: str, request: Request):
     else:
         msg = f"📢 Claude event: {event_type}"
 
-    await _notifier().publish(Event(f"dev.{event_type}", "info", body=msg, actions=actions))
+    if text:
+        msg = text
+
+    await _notifier().publish(Event(f"dev.{event_type}", severity, body=msg, actions=actions))
     return {"ok": True}
 
 

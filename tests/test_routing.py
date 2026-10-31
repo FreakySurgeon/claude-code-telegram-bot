@@ -165,3 +165,12 @@ def test_example_file_mirrors_the_briefings():
     assert [(r.channel, r.mirror) for r in p.route(Event("briefing_morning", "normal"))] == [
         ("zulip", False), ("telegram", True)]
     assert [r.channel for r in p.route(Event("email_triage", "normal"))] == ["zulip"]
+
+
+def test_dev_event_urgent_always_reaches_dev_bot():
+    policy = RoutingPolicy({"default": "zulip", "urgent": ["telegram", "zulip"],
+                            "telegram": {"bot": "gtd", "only_severity": ["urgent"],
+                                         "dev_bot_events": ["completed", "waiting"]}})
+    routes = policy.route(Event("dev.brainstorm", "urgent", body="x"))
+    assert [(r.channel, r.target) for r in routes] == [("telegram", {"bot": "dev"})]
+    assert policy.route(Event("dev.brainstorm", "info", body="x")) == []

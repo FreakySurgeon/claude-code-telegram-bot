@@ -155,7 +155,7 @@ class RoutingPolicy:
     def route(self, event: Event) -> list[ChannelRef]:
         if event.type.startswith("dev."):
             allowed = self.channel_config("telegram").get("dev_bot_events")
-            if allowed is None or event.type[4:] in allowed:
+            if allowed is None or event.severity == "urgent" or event.type[4:] in allowed:
                 return [ChannelRef("telegram", {"bot": "dev"})]
             return []
 
